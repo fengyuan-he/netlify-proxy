@@ -13,11 +13,7 @@ export default async (request: Request, context: Context) => {
   const url = new URL(request.url);
   const newUrl = `${targetUrl}${url.pathname}${url.search}`;
 
-  // Forward the request
-  return fetch(newUrl, {
-    method: request.method,
-    headers: request.headers,
-    body: request.body,
-    redirect: "manual",
-  });
+  // Just clone the request directly
+  const proxiedRequest = new Request(newUrl, request);
+  return fetch(proxiedRequest);
 };
