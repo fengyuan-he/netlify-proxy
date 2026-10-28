@@ -1,19 +1,25 @@
 import type { Context } from "@netlify/edge-functions";
 
-export default async (request: Request, context: Context) => {
-  const targetUrl = Deno.env.get("TARGET_URL");
+const TARGET = Deno.env.get("TARGET_URL")?.replace(/\/+$/, "");
 
-  if (!targetUrl) {
-    return new Response("TARGET_URL environment variable is not set", {
-      status: 500,
-    });
-  }
+export default async (request: Request, _ctx: Context) => {
+  if (!TARGET) return new Response("TARGET_URL not set", { status: 500 });
 
-  // Construct the new URL
   const url = new URL(request.url);
-  const newUrl = `${targetUrl}${url.pathname}${url.search}`;
+  const headers = new Headers(request.headers);
+  headers.set("host", new URL(TARGET).host);
 
-  // Just clone the request directly
-  const proxiedRequest = new Request(newUrl, request);
-  return fetch(proxiedRequest);
+  const res = await fetch(`${TARGET}${url.pathname}${url.search}`, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+    redirect: "manual",          // ①
+  });
+
+  // ✅ 不碰 body，原样流式返回（这一步不变）
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
 };
