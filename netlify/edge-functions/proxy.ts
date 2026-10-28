@@ -11,16 +11,22 @@ export default async function handler(request: Request, _ctx: Context) {
 
   const isBodyless = request.method === "GET" || request.method === "HEAD";
 
-  const res = await fetch(`${TARGET}${url.pathname}${url.search}`, {
-    method: request.method,
-    headers,
-    body: isBodyless ? undefined : await request.arrayBuffer(),
-    redirect: "manual",
-  });
+const res = await fetch(..., { ... });
 
-  return new Response(res.body, {
-    status: res.status,
-    statusText: res.statusText,
-    headers: res.headers,
-  });
+const out = new Headers(res.headers);
+// 代理域和源站域不同：Set-Cookie 里的 Domain 必须去掉，
+// 否则浏览器按域名不匹配直接丢弃
+const cookies = res.headers.getSetCookie?.() ?? [];
+if (cookies.length) {
+  out.delete("set-cookie");
+  for (const c of cookies) {
+    out.append("set-cookie", c.replace(/;\s*domain=[^;]*/gi, ""));
+  }
+}
+
+return new Response(res.body, {
+  status: res.status,
+  statusText: res.statusText,
+  headers: out,
+});
 }
