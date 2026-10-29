@@ -83,6 +83,16 @@
 //     content-encoding；任何一项不满足都当 miss 并删除条目（宁可不缓存，也不能回放坏条目）。
 // 49. 校验失败一律不写缓存：content-length 对不上（源站截断）、超过 2MiB、读失败 → 不缓存；
 //     截断的 body 直接 502，绝不把半截当 200 发出去。
+//
+// ── isolate 内两级内存镜像（2026-10-29）──────────────────────────────────────
+// 50. 生产 trace 分组实测（平均）：bypass 2ms / hit 601ms / miss 1240ms，bypass 与 hit 的差
+//     全在 Cache API —— 在这个边缘，**一次 caches.open + match 就要 0.3~0.6 秒**，而几乎
+//     每个请求都要付一次。所以匿名档在模块作用域再加一层内存镜像：正缓存 4s（命中直接用存下
+//     的字节重建 Response，完全不碰 Cache API）、负缓存 3s（刚确认过 miss 就直接跳过查询）。
+//     写入成功后立刻清掉负标记 —— 否则突发时第一条 miss 会把后面几百条都锁在「不查缓存」上，
+//     它们也就永远看不到刚写进去的条目，缓存收益全丢。
+//     上限 12 条 / 24MiB，按插入顺序淘汰最老的；任何异常静默降级回原有路径。
+//     只服务匿名 GET，带跟踪参数的请求不进镜像；三档判定、竞速、header 改写、trace 字段一律不动。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -191,6 +201,14 @@ const FRESH_MS = 300_000; // 5min：命中即回，不再回源
 const SWR_MS = 600_000; // 10min：命中旧副本 + 后台刷新
 const HARD_STALE_MS = 900_000; // 15min：只在源站 5xx/超时时才肯拿出来的最旧副本
 const STORE_TTL_S = 1_080; // 18min：必须 > HARD_STALE_MS，否则兜底时条目已经没了
+
+// ── isolate 内两级内存镜像（第 50 条）：只服务匿名档，纯加速层，删掉即回到原行为 ──
+// 正缓存 4s：这段时间内再次请求同一个 path+query，直接用内存里的字节重建 Response，不碰 Cache API。
+// 负缓存 3s：刚确认过 miss，这段时间内直接跳过 caches.open/match；写入成功会立刻清掉它。
+const MIRROR_MS = 4_000; // 正缓存 TTL
+const MISS_MIRROR_MS = 3_000; // 负缓存 TTL
+const MIRROR_MAX_ENTRIES = 12; // 每张表各自的条目上限
+const MIRROR_MAX_BYTES = 24 * 1024 * 1024; // 正缓存字节上限
 
 // 用户桶窗口：更宽松，但失效靠 epoch 而不是靠时间
 const USER_FRESH_MS = 120_000; // 120s
@@ -1125,8 +1143,14 @@ type CacheProbe = {
   hit?: CacheHit;
   /** 硬过期窗口内的旧副本：不赢，只在回源出错时兜底。 */
   stale?: StaleHit;
-  /** 写缓存计划；null = 本次不写（打不开缓存 / 带跟踪参数 / 缓存还没就绪）。 */
+  /** 写缓存计划；null = 本次不写（打不开缓存 / 带跟踪参数 / 缓存还没就绪 / 负缓存命中）。 */
   plan: StorePlan | null;
+  /**
+   * 负缓存命中（第 50 条）：这次确实没查 Cache API，但结论仍是 miss。
+   * 只用来在写缓存计划为空时把 x-proxy-cache 如实标成 miss（而不是退化成 bypass），
+   * 不参与任何响应决策。
+   */
+  missMirror?: true;
   /** 用户桶的 x-proxy-user / x-proxy-epoch 观测值（匿名档为 undefined）。 */
   observe?: Observe;
 };
@@ -1421,6 +1445,142 @@ function entryAge(hit: Response): number {
   return ageMs < 0 ? 0 : ageMs; // 时钟回拨时不把条目当永久新鲜
 }
 
+/* ── 匿名档的 isolate 内内存镜像（第 50 条）──────────────────────────────── */
+
+/**
+ * 镜像条目：整段 body 字节 + 原始状态/头 + 存入时刻。
+ *
+ * 键是 `url.pathname + url.search`（不带 cookie —— 匿名档本来就不分用户）。
+ * theme / engine 不参与键，只在命中时校验：Cache API 的键里有这两个维度（第 2 条），
+ * 不校验就会出现「dark 主题的请求拿到 light 主题的 HTML」。
+ */
+type MirrorEntry = {
+  body: ArrayBuffer;
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  at: number;
+  theme: string;
+  engine: string;
+};
+
+/** 正缓存：path+query → 一段可直接重建 Response 的字节。 */
+const mirrorHits = new Map<string, MirrorEntry>();
+/**
+ * 负缓存：path+query → 「确认 miss 的时刻 + 当时的 theme/engine」。
+ *
+ * 键同样只是 path+query，但值里带上维度并在命中时校验：Cache API 的键含有 theme/engine，
+ * 一个 dark 请求的 miss 不该让紧接着的 light 请求也跳过查询（那会白白丢掉一次命中）。
+ */
+const mirrorMisses = new Map<string, { at: number; theme: string; engine: string }>();
+/** 正缓存当前占用字节数（用来卡 MIRROR_MAX_BYTES，避免每次遍历求和）。 */
+let mirrorHitBytes = 0;
+
+function mirrorKeyOf(url: URL): string {
+  return `${url.pathname}${url.search}`;
+}
+
+function mirrorDrop(key: string): void {
+  const entry = mirrorHits.get(key);
+  if (entry === undefined) return;
+  mirrorHitBytes -= entry.body.byteLength;
+  mirrorHits.delete(key);
+}
+
+/** 顺手清掉过期的正/负条目（两张表都 ≤ 12 条，遍历代价可忽略）。 */
+function mirrorPrune(now: number): void {
+  for (const [key, entry] of mirrorHits) {
+    if (now - entry.at >= MIRROR_MS) mirrorDrop(key);
+  }
+  for (const [key, miss] of mirrorMisses) {
+    if (now - miss.at >= MISS_MIRROR_MS) mirrorMisses.delete(key);
+  }
+}
+
+/**
+ * 记一条正缓存，并顺手把负标记清掉（有正条目就不可能还是 miss）。
+ * 超条目 / 超字节时按 **Map 迭代顺序 = 插入顺序** 淘汰最老的。
+ * 任何异常都吞掉：镜像写失败等于没有镜像，绝不能变成 5xx。
+ */
+function mirrorStore(
+  key: string,
+  body: ArrayBuffer,
+  status: number,
+  statusText: string,
+  headers: [string, string][],
+  theme: string,
+  engine: string,
+  now: number,
+): void {
+  try {
+    // 单条就超过总上限：直接不镜像，否则它会把别的条目全部挤掉、自己也留不住。
+    if (body.byteLength > MIRROR_MAX_BYTES) return;
+    mirrorPrune(now);
+    mirrorDrop(key); // 同键覆盖：先把旧的字节数减掉
+    mirrorHits.set(key, { body, status, statusText, headers, at: now, theme, engine });
+    mirrorHitBytes += body.byteLength;
+    mirrorMisses.delete(key);
+    while (mirrorHits.size > MIRROR_MAX_ENTRIES || mirrorHitBytes > MIRROR_MAX_BYTES) {
+      const oldest = mirrorHits.keys().next();
+      if (oldest.done === true) break;
+      mirrorDrop(oldest.value);
+    }
+  } catch {
+    // 静默降级：下一次照样走 Cache API
+  }
+}
+
+/** 取一条正缓存：过期 / 维度不匹配都当没有（过期项顺手删掉）。 */
+function mirrorLookup(key: string, theme: string, engine: string, now: number): MirrorEntry | undefined {
+  const entry = mirrorHits.get(key);
+  if (entry === undefined) return undefined;
+  if (now - entry.at >= MIRROR_MS) {
+    mirrorDrop(key);
+    return undefined;
+  }
+  return entry.theme === theme && entry.engine === engine ? entry : undefined;
+}
+
+/** 负缓存是否还在有效期：命中说明「刚刚查过就是没有」，可以省掉这次 Cache API 查询。 */
+function mirrorMissKnown(key: string, theme: string, engine: string, now: number): boolean {
+  const miss = mirrorMisses.get(key);
+  if (miss === undefined) return false;
+  if (now - miss.at >= MISS_MIRROR_MS) {
+    mirrorMisses.delete(key);
+    return false;
+  }
+  // 维度不同 = 一条不同的缓存键，这次 miss 对它没有参考价值。
+  return miss.theme === theme && miss.engine === engine;
+}
+
+/** 记一条负缓存：重新插入等于把它挪到最年轻的一端。 */
+function mirrorRememberMiss(key: string, theme: string, engine: string, now: number): void {
+  try {
+    mirrorMisses.delete(key);
+    mirrorMisses.set(key, { at: now, theme, engine });
+    while (mirrorMisses.size > MIRROR_MAX_ENTRIES) {
+      const oldest = mirrorMisses.keys().next();
+      if (oldest.done === true) break;
+      mirrorMisses.delete(oldest.value);
+    }
+  } catch {
+    // 静默降级
+  }
+}
+
+/**
+ * 写缓存成功后让负缓存失效（第 50 条的关键一步）：
+ * 不清掉的话，突发里第一批 miss 留下的负标记会让后面几百条请求在 3 秒内根本不查缓存，
+ * 也就看不到刚写进去的条目 —— 缓存收益全丢，还会让源站持续被压。
+ */
+function mirrorForgetMiss(url: URL): void {
+  try {
+    mirrorMisses.delete(mirrorKeyOf(url));
+  } catch {
+    // 静默降级
+  }
+}
+
 function anonStorePlan(cache: Cache, key: Request): StorePlan {
   return { cache, key, ttlSeconds: STORE_TTL_S, requireUserMark: false, missState: "miss" };
 }
@@ -1485,6 +1645,12 @@ function processOrigin(
   try {
     stored = plan.cache
       .put(plan.key, new Response(toCache, { status: 200, statusText: res.statusText, headers: storeHeaders }))
+      .then(() => {
+        // 写成功 ⇒ 立刻让负缓存失效（第 50 条关键一步），否则刚写进去的条目在 3 秒内
+        // 没人看得见，突发流量会一直落在「跳过缓存」的快路径上。
+        // 只有匿名桶需要（负缓存只服务匿名档）；用户桶的键空间不同，不碰。
+        if (!plan.requireUserMark) mirrorForgetMiss(requestUrl);
+      })
       .catch(() => {
         // put 失败后没人读 toCache，必须主动取消，否则客户端分支会被反压拖住。
         void toCache.cancel().catch(() => {});
@@ -1529,12 +1695,72 @@ function tagged(res: Response, observe: Observe): Response {
 
 /* ── 档位一：匿名桶（缓存与两路回源同时开跑，谁先成功用谁）────────────────── */
 
-/** 匿名档的缓存探测：打不开 / match 抛错一律降级为「这一档没有缓存」，绝不 5xx。 */
+/**
+ * 匿名档的缓存探测：打不开 / match 抛错一律降级为「这一档没有缓存」，绝不 5xx。
+ *
+ * 2026-10-29（第 50 条）：在 Cache API 前面先看 isolate 内的两级内存镜像。
+ * 镜像只是加速层 —— 任何一步出错都静默回到原来的 caches.open/match 路径。
+ */
 async function probeAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<CacheProbe> {
   let cache: Cache | null = null;
   let key: Request | null = null;
   let stale: StaleHit | undefined;
   let hit: CacheHit | undefined;
+
+  // 带跟踪参数的请求只读不写（第 5 条），也不进镜像：它们本来就不该被复用。
+  // theme / engine 与 Cache API 键是同一组维度，只用于命中校验（不参与镜像键）。
+  let mirrorable = !hasTrackingParams(url);
+  let mirrorKey = "";
+  let theme = "";
+  let engine = "";
+  if (mirrorable) {
+    try {
+      const dims = bucketDimensions(request);
+      mirrorKey = mirrorKeyOf(url);
+      theme = dims.theme;
+      engine = dims.engine;
+    } catch {
+      mirrorable = false;
+    }
+  }
+
+  // ① 负缓存：刚确认过 miss → 直接跳过 caches.open/match（trace 的 cacheMs 照样有值）。
+  if (mirrorable) {
+    try {
+      if (mirrorMissKnown(mirrorKey, theme, engine, Date.now())) {
+        trace.tCache = Date.now();
+        return { plan: null, missMirror: true };
+      }
+    } catch {
+      // 镜像故障当没有镜像：继续走下面的 Cache API
+    }
+  }
+
+  // ② 正缓存：4 秒内命中过同一个 path+query → 用内存里的字节重建 Response，完全不碰 Cache API。
+  if (mirrorable) {
+    try {
+      const mirrored = mirrorLookup(mirrorKey, theme, engine, Date.now());
+      if (mirrored !== undefined) {
+        const restored = new Response(mirrored.body, {
+          status: mirrored.status,
+          statusText: mirrored.statusText,
+          headers: new Headers(mirrored.headers),
+        });
+        const mirroredAge = entryAge(restored);
+        // 存的瞬间可能正好压在 fresh 窗口边界上：过了 FRESH_MS 就交回常规路径，
+        // SWR 的后台刷新语义不能被镜像改掉。
+        if (mirroredAge < FRESH_MS) {
+          trace.tCache = Date.now();
+          // 与 matched 命中一致：cf-ray 就在镜像下来的头里，回源已经写过就不覆盖。
+          if (trace.colo === undefined) trace.colo = traceColo(restored);
+          return { hit: { res: restored, state: "hit", ageMs: mirroredAge }, plan: null };
+        }
+        mirrorDrop(mirrorKey);
+      }
+    } catch {
+      // 镜像故障当没有镜像：继续走下面的 Cache API
+    }
+  }
 
   try {
     const openedCache = await caches.open(CACHE_NAME);
@@ -1560,6 +1786,27 @@ async function probeAnonymous(request: Request, url: URL, ctx: Context, trace: T
         await discard(matched);
         waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
       }
+
+      // 命中后把同一段字节放进正缓存镜像。这里**后台读**（waitUntil）而不是 await：
+      // 命中路径一旦 await 一次完整 body 拷贝，竞速就可能从「缓存秒赢」变成「回源先赢」，
+      // 那就等于改了既有行为；读失败只是这一次不填镜像。
+      if (mirrorable && hit !== undefined && hit.state === "hit") {
+        waitUntil(
+          ctx,
+          matched
+            .clone()
+            .arrayBuffer()
+            .then((bytes) => {
+              const pairs: [string, string][] = [];
+              matched.headers.forEach((value, name) => pairs.push([name, value]));
+              mirrorStore(mirrorKey, bytes, matched.status, matched.statusText, pairs, theme, engine, Date.now());
+            })
+            .catch(() => {}),
+        );
+      }
+    } else if (mirrorable) {
+      // ③ 记一条负缓存：接下来 3 秒的同类请求不再付这次 Cache API 的 0.3~0.6 秒。
+      mirrorRememberMiss(mirrorKey, theme, engine, Date.now());
     }
   } catch {
     cache = null;
@@ -1627,7 +1874,8 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: T
     undefined,
     trace,
     // 缓存还没就绪就输给了回源：如实标 miss，别退化成 bypass（本档是匿名桶）。
-    decision.probe === null ? "miss" : undefined,
+    // 负缓存命中（第 50 条）同理：没查 Cache API 不代表这一档是 bypass。
+    decision.probe === null || decision.probe.missMirror === true ? "miss" : undefined,
   );
   if (finishing.kind === "stale") return fromCache(finishing.stale.res, "stale-error", finishing.stale.ageMs);
   if (finishing.stored !== undefined) waitUntil(ctx, finishing.stored);
