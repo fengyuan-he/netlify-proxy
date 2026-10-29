@@ -213,8 +213,40 @@ const TARGET_HOST_ALT2: string = TARGET_URL_ALT2 ? TARGET_URL_ALT2.host : "";
 const TARGET_ORIGIN_ALT2: string = TARGET_URL_ALT2 ? TARGET_URL_ALT2.origin : "";
 
 /**
+ * 第四路（2026-10-30 站主："还有没有办法加入第六路竞速"）。
+ *
+ * 为什么值得加：2026-10-29 的实测证明"不同域 = 不同 anycast 路径"是真的 ——
+ * 近 2 天的 trace 里三条腿的胜场是 origin1 1652 / origin2 1401 / **origin3 888**，
+ * 第三路（workers.dev）自己就赢了 23%。既然第三路不是摆设，第四条不同 zone 的域名
+ * 就有同样量级的机会，尤其能改善"某一跳网络抖动"时的尾巴。
+ *
+ * 配置：`TARGET_URL_ALT3`。**站主 2026-10-30 的实际配置是 `https://zhuge-v2.bishojoism.workers.dev`**
+ * （前三路分别是 apex `xn--fpr224a.mom`、`master.…xyz`、`主格.lol`——注意第三路不是 workers.dev，
+ * 这点我一开始搞错了）。workers.dev 属于独立的 zone，任何cast 段与三个中文域都不同，
+ * 所以它是四条腿里路径最"不同"的一条。
+ *
+ * 不设置 ⇒ 竞速仍是三路，行为与本次改动前**逐字一致**。
+ * 代价：单次未命中的回源从 3 次渲染变成 4 次（+33% 源站 CPU），所以只在
+ * "命中率已经靠预热解决、只剩尾巴要削"的阶段才划算。
+ */
+const TARGET_URL_ALT3: URL | null = (() => {
+  try {
+    const raw = Deno.env.get("TARGET_URL_ALT3");
+    if (raw === undefined || raw.trim() === "") return null;
+    return new URL(raw.trim());
+  } catch {
+    return null;
+  }
+})();
+const TARGET_BASE_ALT3: string = TARGET_URL_ALT3
+  ? `${TARGET_URL_ALT3.origin}${TARGET_URL_ALT3.pathname.replace(/\/+$/, "")}`
+  : "";
+const TARGET_HOST_ALT3: string = TARGET_URL_ALT3 ? TARGET_URL_ALT3.host : "";
+const TARGET_ORIGIN_ALT3: string = TARGET_URL_ALT3 ? TARGET_URL_ALT3.origin : "";
+
+/**
  * 竞速目标列表：第 0 项永远是主目标；备用目标按配置依次加入。
- * 竞速的腿数 = 这个数组的长度（1~3），所以"不配环境变量"就等于"只有一条腿"，
+ * 竞速的腿数 = 这个数组的长度（1~4），所以"不配环境变量"就等于"只有一条腿"，
  * 不会出现"打到一个不存在的目标"的情况。
  */
 type OriginTarget = { base: string; origin: string; host: string };
@@ -226,8 +258,11 @@ const ORIGIN_TARGETS: readonly OriginTarget[] = [
   ...(TARGET_BASE_ALT2.length > 0
     ? [{ base: TARGET_BASE_ALT2, origin: TARGET_ORIGIN_ALT2, host: TARGET_HOST_ALT2 }]
     : []),
+  ...(TARGET_BASE_ALT3.length > 0
+    ? [{ base: TARGET_BASE_ALT3, origin: TARGET_ORIGIN_ALT3, host: TARGET_HOST_ALT3 }]
+    : []),
 ];
-/** 竞速的腿数（1~3）。第二路只在有备用目标时才存在。 */
+/** 竞速的腿数（1~4）。每一路都只在配了对应环境变量时才存在。 */
 const RACE_LEGS = ORIGIN_TARGETS.length;
 
 const CACHE_VERSION = "v4";
@@ -481,7 +516,7 @@ type Trace = {
    * 静态档只有一路回源，赢家记 `static`（缓存赢仍记 `cache`），不占用 origin1 / origin2 的语义。
    * 注意：静态档恒不上报（trace.static），这个值只在本进程内用于分段计时与日志判读。
    */
-  race?: "cache" | "origin1" | "origin2" | "origin3" | "static" | "none";
+  race?: "cache" | "origin1" | "origin2" | "origin3" | "origin4" | "static" | "none";
   /**
    * 本次请求走的档位（2026-10-29）。**只进 trace 日志，绝不进响应头。**
    *
@@ -1271,7 +1306,7 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
 
 /* ── 三路竞速：缓存 + 两路回源（2026-10-29）─────────────────────────────── */
 
-type OriginWinner = { res: Response; label: "origin1" | "origin2" | "origin3"; ms: number };
+type OriginWinner = { res: Response; label: "origin1" | "origin2" | "origin3" | "origin4"; ms: number };
 
 type OriginRace = {
   /** 第一路成功返回的回源（含它自己的耗时）；两路都失败时 reject，错误原样交给调用方。 */
@@ -1288,8 +1323,8 @@ type OriginRace = {
  * 失败不在这里吞：两路都 reject 时 winner 也 reject，调用方照旧走 502 / stale 错误路径。
  */
 function startOriginRace(request: Request, url: URL, options: OriginOptions): OriginRace {
-  // 腿数 = 配置了几个目标（1~3）。1 个目标时退化成单路回源，不做竞速。
-  const labels = ["origin1", "origin2", "origin3"] as const;
+  // 腿数 = 配置了几个目标（1~4）。1 个目标时退化成单路回源，不做竞速。
+  const labels = ["origin1", "origin2", "origin3", "origin4"] as const;
   const legCount = Math.max(1, RACE_LEGS);
   const controllers: AbortController[] = Array.from({ length: legCount }, () => new AbortController());
   let decided = false;
@@ -1321,7 +1356,7 @@ function startOriginRace(request: Request, url: URL, options: OriginOptions): Or
     return fetchOrigin(attempt, url, legOptions).then((res) => {
       const value: OriginWinner = {
         res,
-        label: (labels[index] ?? "origin1") as "origin1" | "origin2" | "origin3",
+        label: (labels[index] ?? "origin1") as "origin1" | "origin2" | "origin3" | "origin4",
         ms: Math.max(0, Date.now() - startedAt),
       };
       if (decided) {
