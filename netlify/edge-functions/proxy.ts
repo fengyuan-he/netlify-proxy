@@ -1101,6 +1101,22 @@ function applyCdnPolicy(
         CDN_CACHE_CONTROL,
         `public, max-age=${ANON_TTL_S}, stale-while-revalidate=${ANON_SWR_S}`,
       );
+      /**
+       * 2026-10-29 线上实测：光设 `Netlify-CDN-Cache-Control` **不够**。
+       *
+       * 源站对匿名 HTML 发的是 `Cache-Control: private, no-cache`（登录态语义），
+       * 这个 `private` 是"禁止任何共享缓存存储"的硬指令，于是 CDN 根本没存：
+       * 连打三次同一 URL，三次都是 `X-Proxy-Cache: miss`（函数每次都执行）。
+       *
+       * 所以必须把**浏览器侧**的头一起改掉，否则 `Netlify-CDN-Cache-Control` 被无视：
+       *   · `private` → `public`（允许共享缓存存储）
+       *   · `max-age=0, must-revalidate` → 浏览器每次都回源校验（拿到的一定是新鲜内容），
+       *     真正的缓存时长由 `Netlify-CDN-Cache-Control` 决定，两者互不干扰
+       *   · 顺手删 `Expires` / `Pragma`：老式"不缓存"指令，会让某些代理层再次拒绝存储
+       */
+      headers.set("cache-control", "public, max-age=0, must-revalidate");
+      headers.delete("expires");
+      headers.delete("pragma");
       // x-proxy-cache 兼容（第 26 条）：这一份是回源取的、并且会交给 CDN 存 ⇒ 与旧的 miss 等价。
       headers.set(CACHE_STATE, "miss");
       headers.set(CDN_STATE, "anon");
@@ -1109,6 +1125,11 @@ function applyCdnPolicy(
 
     if (tier === "static" && base && isStaticContentType(response.headers)) {
       headers.set(CDN_CACHE_CONTROL, `public, max-age=${STATIC_TTL_S}, immutable`);
+      // 同上：源站可能带 `no-cache`/`private`，会把 CDN 挡住。静态资源本来就不该让浏览器
+      // 每次校验，所以这里给长 max-age，与 CDN 的 30 天对齐。
+      headers.set("cache-control", `public, max-age=${STATIC_TTL_S}, immutable`);
+      headers.delete("expires");
+      headers.delete("pragma");
       headers.set(CACHE_STATE, "miss");
       headers.set(CDN_STATE, "static");
       return { response: withBody(response, headers), cdn: "static" };
