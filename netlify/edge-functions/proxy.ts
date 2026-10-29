@@ -385,6 +385,7 @@ function getCache(name: string = CACHE_NAME): Promise<Cache> {
 
 const ORIGIN_TIMEOUT_MS = 15_000; // 只卡响应头
 const MAX_QUERY_PARAMS = 6; // 防随机参数把缓存打爆
+
 const OLD_CHROME_BELOW = 88; // 必须与源站阈值一致
 const DEFAULT_CC = "private, no-cache";
 
@@ -394,6 +395,8 @@ const UID_HASH_HEX_LEN = 16; // sha256 前 16 个十六进制字符（64bit）�
 const USER_TAG_LEN = 8; // 只对外露出 8 位，绝不出完整 hash / 完整 cookie
 
 const BORN = "x-proxy-born";
+/** 2026-10-30（第 62 条）：这一发是"真去取的"还是"搭了别人的车"。1 = 共享来的。 */
+const COALESCE_STATE = "x-proxy-coalesced";
 const ORIGIN_CC = "x-proxy-origin-cc";
 const CACHE_STATE = "x-proxy-cache";
 const CACHE_AGE = "x-proxy-age";
@@ -2277,8 +2280,123 @@ async function probeAnonymous(request: Request, url: URL, ctx: Context, trace: T
   return { hit, stale, plan: writable ? anonStorePlan(cache!, key!) : null };
 }
 
-async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
-  const proxyOrigin = url.origin;
+/* ── 请求合并（single-flight，第 62 条，2026-10-30）──────────────────────── */
+
+/**
+ * 同一 key 的并发未命中，只让一个请求真去回源，其余等它的结果。
+ *
+ * ## 为什么需要
+ *
+ * itdog 的 318 个节点打同一个**新 URL**（随机参数 ⇒ 必然未命中）时，实测：
+ *   · 反代自身只花 80ms；
+ *   · 而"回源那一段"（`up`）中位 2.9 秒、最高 6.2 秒。
+ * 也就是说源站被 318 × 4 条腿（`RACE_LEGS = 4`）的并发渲染淹了。
+ * 竞速对**单发延迟**是好事，但在"同一个 key 被同时打 318 次"时它会乘以 4。
+ *
+ * 合并之后：同一个 isolate 内，同一个 key 只跑一次竞速，其余请求共享那份字节。
+ * 期望从「318 × 4 次渲染」降到「isolate 数 × 4 次」。
+ *
+ * ## 边界（都是刻意的）
+ *
+ * · **只在 isolate 内合并**：内存 Map 不跨实例，这是平台限制，不是设计选择；
+ * · **不共享 `Set-Cookie`**：每次请求的 `zhuge_d1bm`（D1 会话 bookmark）是逐客户端的，
+ *   把它回放给 318 个客户端是错的 —— 所以等待者拿到的那份**删掉 set-cookie**；
+ * · **只共享能缓冲的响应**（≤ 2MiB）：缓不下来就退化成"各打各的"，宁可惊群也不出错；
+ * · **失败不重试**：领导失败 ⇒ 等待者拿 null ⇒ 各自走一遍正常流程（罕见路径）。
+ */
+type SharedEntry = {
+  status: number;
+  statusText: string;
+  headers: Array<[string, string]>;
+  /** 用 ArrayBuffer 而不是 Uint8Array：这个 lib 配置下后者不能直接当 BodyInit。 */
+  body: ArrayBuffer;
+};
+
+const COALESCE_MAX_BYTES = 2 * 1024 * 1024;
+/** key → 正在取的那一份（null 表示"没合并成功，等待者自己去取"）。 */
+const coalesceInflight = new Map<string, Promise<SharedEntry | null>>();
+
+function replayShared(shared: SharedEntry): Response {
+  const headers = new Headers();
+  for (const [name, value] of shared.headers) {
+    // 每个客户端的会话 bookmark 不能共享（见上方边界说明）
+    if (name.toLowerCase() === "set-cookie") continue;
+    headers.append(name, value);
+  }
+  headers.set(COALESCE_STATE, "1");
+  return new Response(shared.body, { status: shared.status, statusText: shared.statusText, headers });
+}
+
+/**
+ * 给一次"缓存未命中的 GET"套上合并。
+ *
+ * `run` 就是原来那一整套（探测 + 四路竞速 + 收尾），原样传入，不在里面改任何逻辑。
+ * 命中路径根本不会走到这里之后的行为差异：只要缓存探测赢了，`run` 内部立刻返回，
+ * 缓冲与共享都只是多一次内存拷贝（命中本来是 1~6ms，实测无可见影响）。
+ */
+async function serveCoalesced(
+  tier: "anon" | "user",
+  request: Request,
+  url: URL,
+  run: () => Promise<Response>,
+): Promise<Response> {
+  let uidHash = "";
+  if (tier === "user") {
+    const session = readSessionCookie(request);
+    if (session === null) return run();
+    try {
+      uidHash = await uidHashOf(session);
+    } catch {
+      return run(); // 没有 crypto.subtle：不合并，直接走原路径
+    }
+    if (uidHash === "") return run();
+  }
+
+  const { theme, engine } = bucketDimensions(request);
+  const key = `${tier}\u0000${uidHash}\u0000${theme}\u0000${engine}\u0000${cacheIdPath(url)}`;
+
+  const existing = coalesceInflight.get(key);
+  if (existing !== undefined) {
+    const shared = await existing;
+    if (shared !== null) return replayShared(shared);
+    return run(); // 领导那发不可共享：自己做（罕见）
+  }
+
+  let original: Response | null = null;
+  const pending = (async (): Promise<SharedEntry | null> => {
+    const res = await run();
+    original = res;
+    if (res.body === null) return null;
+    let bytes: Uint8Array | null = null;
+    try {
+      // 读 clone：读失败/超限时**原响应仍然可用**（与延迟写那条路同一手法）
+      bytes = await readBodyCapped(res.clone().body, COALESCE_MAX_BYTES);
+    } catch {
+      bytes = null;
+    }
+    if (bytes === null) return null;
+    const hdrs: Array<[string, string]> = [];
+    res.headers.forEach((value, name) => hdrs.push([name, value]));
+    // 拷成独立的 ArrayBuffer：bytes 可能只是某个更大缓冲区的视图
+    const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    return { status: res.status, statusText: res.statusText, headers: hdrs, body };
+  })();
+
+  coalesceInflight.set(key, pending);
+  void pending.finally(() => coalesceInflight.delete(key)).catch(() => undefined);
+
+  const shared = await pending;
+  if (shared === null) {
+    // 不能共享：把原来的响应交出去（clone 已被取消，原流没被动过）
+    return original ?? text(502, "Bad Gateway");
+  }
+  const headers = new Headers();
+  for (const [name, value] of shared.headers) headers.append(name, value);
+  headers.set(COALESCE_STATE, "0"); // 0 = 我是那个真去取的
+  return new Response(shared.body, { status: shared.status, statusText: shared.statusText, headers });
+}
+
+async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {  const proxyOrigin = url.origin;
 
   // ① 两路回源立刻出发：缓存查询（②）与它们并行，谁先给出可用结果谁赢。
   //    能走到本档的一定是 GET（classifyTier 拦掉了其他方法），所以这里不用再判方法。
@@ -2890,10 +3008,10 @@ export default async function handler(request: Request, ctx: Context): Promise<R
     trace.tier = classifyTier(request, url);
     switch (trace.tier) {
       case "anon":
-        response = await serveAnonymous(request, url, ctx, trace);
+        response = await serveCoalesced("anon", request, url, () => serveAnonymous(request, url, ctx, trace));
         break;
       case "user":
-        response = await serveMember(request, url, ctx, trace);
+        response = await serveCoalesced("user", request, url, () => serveMember(request, url, ctx, trace));
         break;
       default:
         // 直连档没有缓存查询：tCache = t0（在 serveDirect 里补）
