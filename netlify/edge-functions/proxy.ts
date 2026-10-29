@@ -731,9 +731,15 @@ function withBody(res: Response, headers: Headers): Response {
  *   开缓存 / 算缓存键 / 算 uidHash / 收 POST body / 改 Location·Set-Cookie / tee body …
  * 没有回源（缓存命中）时 = 整个函数耗时（那时全是代理开销）。
  *
- * 合并按 RFC 8941 的列表语义：源站指标在前，逗号 + `proxy;dur` 追加在后；源站一个都没有时
- * 只输出 `proxy;dur`（补位，不是覆盖）。上限 5 个指标：源站固定 3 个（d1/ssr/app）+ 代理 1 个
- * = 4 个；万一源站以后加指标，这里会把多出来的截掉，保证不超限。
+ * `total;dur` = `tEnd - t0`：**反代视角的整段服务时长**（收到请求 → 交出首字节前）。
+ * 客户端拿它才能把「用户 → 反代」那段减出来：
+ *   `responseStart - requestStart - total`（上行 + 排队），以及 `total - proxy` ≈ 回源往返。
+ * 缓存命中 / 回源失败（502）/ 302 / 直连档都走 handler 末尾同一个出口，所以一律有值。
+ *
+ * 合并按 RFC 8941 的列表语义：源站指标在前，逗号 + `proxy;dur` + `total;dur` 追加在后；
+ * 源站一个都没有时只输出 `proxy;dur, total;dur`（补位，不是覆盖）。上限 5 个指标：
+ * 源站固定 3 个（d1/ssr/app）+ 代理 2 个（proxy/total）= 5 个，正好顶格；
+ * 万一源站以后加指标，这里会把多出来的截掉（只留源站前 3 个），保证不超限。
  *
  * ⚠️ 只有**本次真的回源了**才透传源站的段（`inherit=false` 时丢掉）：
  * 缓存条目里存着「当初那次回源」的 d1/ssr/app，回放时那不是本次的耗时，留着就是把旧数冒充本次。
@@ -763,13 +769,21 @@ function splitServerTiming(raw: string): string[] {
   return parts.map((part) => part.trim()).filter((part) => part.length > 0);
 }
 
-function withServerTiming(res: Response, proxyMs: number, inheritOriginTiming: boolean): Response {
+function withServerTiming(
+  res: Response,
+  proxyMs: number,
+  totalMs: number,
+  inheritOriginTiming: boolean,
+): Response {
   try {
     const headers = new Headers(res.headers);
     const inherited = inheritOriginTiming
-      ? splitServerTiming(headers.get("server-timing") ?? "").slice(0, MAX_SERVER_TIMING_METRICS - 1)
+      // 给 proxy / total 留两个位：源站最多留 3 条（d1/ssr/app）。
+      ? splitServerTiming(headers.get("server-timing") ?? "").slice(0, MAX_SERVER_TIMING_METRICS - 2)
       : [];
     inherited.push(`proxy;dur=${Math.max(0, Math.round(proxyMs))}`);
+    // 反代视角整段：收到请求 → 交出首字节。与 proxy 的差就是回源往返（up）。
+    inherited.push(`total;dur=${Math.max(0, Math.round(totalMs))}`);
     headers.set("server-timing", inherited.join(", "));
     return withBody(res, headers);
   } catch {
@@ -1128,6 +1142,7 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   } catch {
     // 埋点自身任何异常一律吞掉：响应保持不变
   }
-  // Server-Timing：透传源站的 d1/ssr/app，追加本代理的 proxy;dur。
-  return withServerTiming(response, proxyMs, originFresh);
+  // Server-Timing：透传源站的 d1/ssr/app，追加本代理的 proxy;dur 与 total;dur。
+  // total 用的是上面这一刻的 tEnd（返回响应前），所以包含到「交出首字节」为止的全部反代时间。
+  return withServerTiming(response, proxyMs, totalMs, originFresh);
 }
