@@ -3019,6 +3019,17 @@ export default async function handler(request: Request, ctx: Context): Promise<R
      */
     headers.set("x-proxy-legs", String(RACE_LEGS));
     headers.set("x-proxy-targets", ORIGIN_TARGETS.map((t) => t.host).join(","));
+    /**
+     * 2026-10-30：**这一发是第几路赢的**。
+     *
+     * 为什么必须放在响应头：`race` 原本只进 trace，而 trace 只记慢请求（>800ms）或 2% 采样。
+     * 预热铺开之后，未命中也就 60~120ms ⇒ **永远进不了 trace** ⇒ 想统计"第四路赢过几次"
+     * 在日志里根本查不到（实测连打 12 发全是 miss，日志一条没留）。
+     *
+     * 放响应头之后，手动打 N 发就能直接数：`x-proxy-race: origin4` 出现几次。
+     * 值域与 trace 完全一致（cache / origin1..4 / static / none）。
+     */
+    headers.set("x-proxy-race", trace.race ?? "none");
     return new Response(withTiming.body, {
       status: withTiming.status,
       statusText: withTiming.statusText,
