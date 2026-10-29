@@ -93,6 +93,20 @@
 //     它们也就永远看不到刚写进去的条目，缓存收益全丢。
 //     上限 12 条 / 24MiB，按插入顺序淘汰最老的；任何异常静默降级回原有路径。
 //     只服务匿名 GET，带跟踪参数的请求不进镜像；三档判定、竞速、header 改写、trace 字段一律不动。
+//
+// ── 缓存句柄上提 / 计时拆分 / isolate 维度（2026-10-29）──────────────────────
+// 51. `caches.open()` 提到模块作用域，每个 isolate 只开一次：实测 hit 均值 601ms / miss 1240ms，
+//     但 hit 最小值只有 3ms —— 快路径证明这笔开销不是固有的，而是「几乎每个请求都重新 open」。
+//     Netlify 文档明确允许把 open 提到顶层（只有 match/put/delete 必须在请求内），所以 open 只留
+//     在 isolate 的第一个请求上，之后直接复用同一个 Promise。
+//     计时同时拆成 openMs / matchMs 两段（cacheMs 的口径不变，仍是「进函数 → 查询结束」，
+//     即 open + match 的总和，日志兼容）：不拆的话「open 慢」和「match 慢」挤在一个数里，
+//     改哪一边都只能靠猜；拿不到就记 0。
+//     另加 isolate 维度：`iso` 是本 isolate 的随机 6 位标识，`seq` 是本 isolate 内第几个请求。
+//     二者**只进 trace 日志、绝不进响应头**。用途：seq 连续且 iso 相同的一段里 cacheMs 一起变大，
+//     说明是同一 isolate 上在缓存后端排队 / 冷连接；换了 iso 才变慢，说明是新 isolate 的冷启动。
+//     降级语义不变：open 失败时把句柄槽位置回 null（下一个请求重试），本次按「这一档没有缓存」走，
+//     四个调用点照旧各自 catch，绝不 5xx。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -237,6 +251,64 @@ const STATIC_KEY_ORIGIN = "https://static-cache.internal";
 // 条目里没记到源站原值时的兜底（源站对这些资源实际发的是 immutable 1 年）。
 const STATIC_DEFAULT_CC = "public, max-age=31536000, immutable";
 
+/* ── 缓存句柄上提 + isolate 维度（第 51 条）────────────────────────────────── */
+
+/**
+ * 本 isolate 的随机标识：只用于把 trace 日志按 isolate 分组，**绝不进响应头**（避免泄漏部署细节）。
+ */
+const ISOLATE_ID = Math.random().toString(36).slice(2, 8);
+
+/**
+ * 本 isolate 内的请求序号：handler 入口 +1 后记进本次 trace。
+ * 与 iso 一起读日志就能分清「同一个 isolate 上排队」和「请求换了 isolate」。
+ */
+let REQ_SEQ = 0;
+
+/**
+ * 每个 isolate 只 `caches.open()` 一次，之后所有请求复用同一个 Promise（第 51 条）。
+ *
+ * 为什么可以上提：Netlify 文档明确说 open 可以提到模块顶层，只有 match / put / delete 必须在请求内。
+ * 上提之后 open 只在这个 isolate 的第一个请求上真正花钱，cacheMs 剩下的部分才是 match 的成本。
+ *
+ * 降级语义与原来一致：open 失败 = 「这一档没有缓存」。
+ * 失败时把槽位置回 null，下一个请求会重新 open（否则一个 isolate 会永久失去缓存）；
+ * reject 原样抛给调用方 —— 四个调用点本来就都包在 try/catch 里，最终只是本次不回写、绝不 5xx。
+ *
+ * 本文件只有两个 cache 名：CACHE_NAME（匿名 / 登录两档共用）与 STATIC_CACHE_NAME（静态档），
+ * 各占一个槽位；不传参就是 HTML 那两档。
+ */
+let cachePromise: Promise<Cache> | null = null;
+let staticCachePromise: Promise<Cache> | null = null;
+
+function getCache(name: string = CACHE_NAME): Promise<Cache> {
+  const isStatic = name === STATIC_CACHE_NAME;
+  const pending = isStatic ? staticCachePromise : cachePromise;
+  if (pending !== null) return pending;
+
+  let created: Promise<Cache>;
+  try {
+    created = caches.open(name);
+  } catch (err) {
+    // 运行时没有 Cache API（或 open 同步抛错）：不占槽位，本次直接降级成「没有缓存」。
+    return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+  }
+
+  if (isStatic) staticCachePromise = created;
+  else cachePromise = created;
+
+  // 失败就把槽位摘掉，允许下一个请求重试；这个 catch 同时保证失败的 Promise 有处理器
+  // （不会变成 unhandled rejection），而 reject 本身仍原样返回给调用方。
+  created.catch(() => {
+    if (isStatic) {
+      if (staticCachePromise === created) staticCachePromise = null;
+    } else if (cachePromise === created) {
+      cachePromise = null;
+    }
+  });
+
+  return created;
+}
+
 const ORIGIN_TIMEOUT_MS = 15_000; // 只卡响应头
 const MAX_QUERY_PARAMS = 6; // 防随机参数把缓存打爆
 const OLD_CHROME_BELOW = 88; // 必须与源站阈值一致
@@ -338,8 +410,22 @@ type Observe = { user?: string; epoch?: number };
  */
 type Trace = {
   t0: number;
+  /** 本 isolate 的随机标识（第 51 条）：只进 trace 日志，绝不进响应头。 */
+  iso: string;
+  /** 本 isolate 内的请求序号（第 51 条）：只进 trace 日志，用来区分排队与换 isolate。 */
+  seq: number;
   /** 缓存查询结束；直连档没有缓存查询，取 t0。 */
   tCache?: number;
+  /**
+   * `caches.open()` 那一段的耗时（第 51 条）。open 已在模块级缓存，除 isolate 首个请求外恒为 0；
+   * 没走缓存探测（镜像命中 / 负缓存 / 直连档）时保持 undefined，上报时按 0 处理。
+   */
+  openMs?: number;
+  /**
+   * `cache.match()` 那一段的耗时（第 51 条）；用户档的 epoch 读取不在这两段里，
+   * 但仍算在 cacheMs 内（cacheMs 口径不变，见第 51 条）。
+   */
+  matchMs?: number;
   /** 发起回源 fetch 的时刻；没有回源（缓存命中）时为空。 */
   tFetch?: number;
   /** 回源响应头到达（fetch 返回那一刻）；竞速时 = 赢家那一路的耗时。 */
@@ -494,8 +580,14 @@ function reportTrace(
     // 一行结构化日志：Netlify 函数日志里 grep `[trace]` 就能直接看出慢在哪一段。
     // region = 本函数跑在哪个区域（Netlify 调度结果）；colo = CF 服务源站的那个机房。
     // 两者通常同区（SIN↔ap-southeast、EWR/IAD↔us-east-1），但 region 才是"抽签"的直接证据。
+    // open / match 是 cacheMs 拆出来的两段（第 51 条），紧跟在 cacheMs 后面，方便正则切：
+    //   /cacheMs=(\d+)ms open=(\d+)ms match=(\d+)ms/
+    // iso / seq 只在这里出现（绝不进响应头）：同一 isolate 且 seq 连续的一段里 cacheMs 一起变大
+    // 就是缓存后端排队；iso 变了才变慢则是新 isolate 的冷连接。
+    const openMs = trace.openMs ?? 0;
+    const matchMs = trace.matchMs ?? 0;
     console.log(
-      `[trace] region=${edgeRegion()} cache=${cache} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms colo=${trace.colo ?? "?"} path=${path}`,
+      `[trace] region=${edgeRegion()} cache=${cache} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms open=${openMs}ms match=${matchMs}ms colo=${trace.colo ?? "?"} path=${path} iso=${trace.iso} seq=${trace.seq}`,
     );
     // 先把请求发出去，再尝试挂到 waitUntil 上：补报（响应已经交出后才上报）时
     // waitUntil 窗口可能已经关了，此时请求至少已经发出，不会被这段 try 吞掉。
@@ -939,7 +1031,7 @@ async function bumpEpochForRequest(request: Request): Promise<void> {
   if (session === null) return;
   try {
     const uidHash = await uidHashOf(session);
-    const cache = await caches.open(CACHE_NAME);
+    const cache = await getCache(); // 与匿名/用户档共用同一个 isolate 句柄（第 51 条）
     await bumpEpoch(cache, uidHash);
   } catch {
     // 抓不到缓存 / 没有 crypto：写请求照常成功，只是这次失效没生效
@@ -1763,12 +1855,16 @@ async function probeAnonymous(request: Request, url: URL, ctx: Context, trace: T
   }
 
   try {
-    const openedCache = await caches.open(CACHE_NAME);
+    const tOpen = Date.now();
+    const openedCache = await getCache(); // 模块级句柄（第 51 条）：除 isolate 首个请求外几乎零成本
+    trace.openMs = Date.now() - tOpen;
     const cacheKey = buildCacheKey(request, url);
     cache = openedCache;
     key = cacheKey;
 
+    const tMatch = Date.now();
     const matched = await openedCache.match(cacheKey);
+    trace.matchMs = Date.now() - tMatch;
     trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
     if (matched) {
       // 命中时没有回源，但条目里存的就是当初的源站响应头（cf-ray 也在），
@@ -1900,7 +1996,9 @@ async function probeMember(
   let observe: Observe = { user: tag };
 
   try {
-    const openedCache = await caches.open(CACHE_NAME);
+    const tOpen = Date.now();
+    const openedCache = await getCache(); // 与匿名档同一个 isolate 句柄（第 51 条）
+    trace.openMs = Date.now() - tOpen;
     // epoch 只在这里读一次，之后回源、写缓存全程用同一个值：
     // 回源期间发生的写操作只会让新内容落到新 epoch，不会把旧 HTML 写进当前 epoch。
     const epoch = await readEpoch(openedCache, uidHash);
@@ -1909,7 +2007,9 @@ async function probeMember(
     key = cacheKey;
     observe = { user: tag, epoch };
 
+    const tMatch = Date.now();
     const matched = await openedCache.match(cacheKey);
+    trace.matchMs = Date.now() - tMatch;
     trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
     if (matched) {
       // 同匿名档：命中条目里存着当初的源站响应头，cf-ray 可用。回源已经写过 colo 就不覆盖。
@@ -2221,10 +2321,14 @@ async function readStaticEntry(
  */
 async function probeStatic(url: URL, ctx: Context, trace: Trace): Promise<StaticProbe> {
   try {
-    const openedCache = await caches.open(STATIC_CACHE_NAME);
+    const tOpen = Date.now();
+    const openedCache = await getCache(STATIC_CACHE_NAME); // 静态档自己的 isolate 句柄（第 51 条）
+    trace.openMs = Date.now() - tOpen;
     const cacheKey = buildStaticCacheKey(url);
 
+    const tMatch = Date.now();
     const matched = await openedCache.match(cacheKey);
+    trace.matchMs = Date.now() - tMatch;
     trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
     if (matched) {
       if (trace.colo === undefined) trace.colo = traceColo(matched);
@@ -2384,12 +2488,15 @@ async function serveStatic(request: Request, url: URL, ctx: Context, trace: Trac
 
 export default async function handler(request: Request, ctx: Context): Promise<Response> {
   const t0 = Date.now(); // 链路追踪：进函数（2026-10-29）
+  // 本 isolate 的第几个请求（第 51 条）：只进 trace 日志。计数放在最前面，连配置缺失的 500 也算一次。
+  REQ_SEQ += 1;
+  const seq = REQ_SEQ;
   if (TARGET_URL === null || TARGET_ORIGIN.length === 0) {
     return text(500, "TARGET_URL environment variable is missing or invalid");
   }
 
   const url = new URL(request.url);
-  const trace: Trace = { t0 };
+  const trace: Trace = { t0, iso: ISOLATE_ID, seq };
   let response: Response;
 
   // 第四档（静态资源）在分流之前单独判一次：GET + 静态前缀 + 无 Range 才接管。
