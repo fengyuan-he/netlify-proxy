@@ -102,6 +102,37 @@ const TARGET_BASE: string = TARGET_URL
   ? `${TARGET_URL.origin}${TARGET_URL.pathname.replace(/\/+$/, "")}`
   : "";
 
+/**
+ * 竞速第二路的目标（2026-10-29）——**只从环境变量读，代码里不写死任何域名**。
+ *
+ * 为什么不写死：本文件其它目标（TARGET_URL）都走环境变量，写死一个域名会让
+ * "换域名"变成改代码；而且一旦那个域名的 DNS/证书出问题，第二路会静默失败。
+ *
+ * 配置：Netlify 站点设置里加环境变量
+ *   TARGET_URL_ALT = https://master.xn--cnqs3e5vdw9icjz2q1eaa.xyz
+ * 不设置（或设为空）⇒ 第二路回退到与第一路相同的目标 ⇒ 行为与本改动前完全一致，
+ * 不会有任何副作用。
+ *
+ * 原理：两个域名分属不同 zone，CF 宣告的是**不同 anycast IP 段**，
+ * BGP 可能落到不同机房（实测同一台机器：apex→NRT、master→LHR）。
+ * 而同域名两路的目标 IP 相同 ⇒ 同一条路 ⇒ 竞速只能拿到"两次同样的慢"
+ * （实测竞速前后 1456ms → 1533ms，无收益）。
+ */
+const TARGET_URL_ALT: URL | null = (() => {
+  try {
+    const raw = Deno.env.get("TARGET_URL_ALT");
+    if (raw === undefined || raw.trim() === "") return null;
+    return new URL(raw.trim());
+  } catch {
+    return null;
+  }
+})();
+const TARGET_BASE_ALT: string = TARGET_URL_ALT
+  ? `${TARGET_URL_ALT.origin}${TARGET_URL_ALT.pathname.replace(/\/+$/, "")}`
+  : "";
+const TARGET_HOST_ALT: string = TARGET_URL_ALT ? TARGET_URL_ALT.host : "";
+const TARGET_ORIGIN_ALT: string = TARGET_URL_ALT ? TARGET_URL_ALT.origin : "";
+
 const CACHE_VERSION = "v4";
 // BUILD_ID 只在这里读一次（Deno.env 在本文件的类型检查里没有声明，多处引用只会多几条同类错误）。
 // 行为与原来逐字等价：两档 cache 名的后缀仍是同一个 BUILD_ID，取不到仍是 "static"。
@@ -857,6 +888,11 @@ type OriginOptions = {
   /** 强制 accept-encoding: gzip（缓存档必须，保证桶里只有一种编码）。 */
   forceGzip: boolean;
   /**
+   * 换一个目标 base（2026-10-29）：竞速第二路打备用域名，让 BGP 可能选到别的机房。
+   * 不传 = 用 TARGET_BASE。
+   */
+  baseOverride?: string;
+  /**
    * 强制 accept-encoding: identity（静态档必须，见第 46 条）。
    * 静态条目的键里没有编码维度，只有 identity 字节才能回放给任何客户端。
    */
@@ -896,24 +932,32 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
     headers.set("accept-encoding", "identity");
   }
 
+  // 换目标（竞速第二路）：base / origin / host 都跟着这一路走，
+  // 否则源站看到的 Host 与实际目标不符，会按旧 Host 拼绝对地址或判错来源。
+  const altBase = options.baseOverride;
+  const useAlt = altBase !== undefined && altBase === TARGET_BASE_ALT && TARGET_BASE_ALT.length > 0;
+  const legOrigin = useAlt ? TARGET_ORIGIN_ALT : TARGET_ORIGIN;
+  const legHost = useAlt ? TARGET_HOST_ALT : TARGET_HOST;
+  const base = useAlt ? TARGET_BASE_ALT : TARGET_BASE;
+
   const origin = request.headers.get("origin");
-  if (origin !== null && origin === proxyOrigin) headers.set("origin", TARGET_ORIGIN);
+  if (origin !== null && origin === proxyOrigin) headers.set("origin", legOrigin);
 
   const referer = headers.get("referer");
   if (referer !== null) {
     if (options.canonicalReferer) {
-      headers.set("referer", `${TARGET_ORIGIN}${url.pathname}${url.search}`);
+      headers.set("referer", `${legOrigin}${url.pathname}${url.search}`);
     } else if (referer === proxyOrigin || referer.startsWith(`${proxyOrigin}/`)) {
-      headers.set("referer", `${TARGET_ORIGIN}${referer.slice(proxyOrigin.length)}`);
+      headers.set("referer", `${legOrigin}${referer.slice(proxyOrigin.length)}`);
     }
   }
 
   const clientIp = request.headers.get("x-nf-client-connection-ip");
   if (clientIp !== null && clientIp.length > 0) headers.set("x-forwarded-for", clientIp);
-  headers.set("x-forwarded-host", TARGET_HOST);
+  headers.set("x-forwarded-host", legHost);
   headers.set("x-forwarded-proto", "https");
 
-  const target = `${TARGET_BASE}${url.pathname}${url.search}`;
+  const target = `${base}${url.pathname}${url.search}`;
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
   const payload = hasBody ? await request.arrayBuffer() : undefined;
 
@@ -970,7 +1014,25 @@ function startOriginRace(request: Request, url: URL, options: OriginOptions): Or
     // 免得以后被复用到带 body 的方法上时两路互相锁死）。
     const attempt = index === 0 ? request : request.clone();
     const startedAt = Date.now();
-    return fetchOrigin(attempt, url, { ...options, signal: controller.signal }).then((res) => {
+    /**
+     * 2026-10-29：**第二路改打备用域名**（TARGET_BASE_ALT）。
+     *
+     * 起因：站主发现"同一用户一会儿快一会儿慢"，实测同一个出口 IP 会被 CF 分到
+     * SIN / EWR / IAD / **MRS（马赛）** 等不同机房——`region=aws-ap-southeast-1` 却
+     * `colo=MRS`。而两路都打同一个目标域名时，CF 看到的目标 IP 相同、BGP 路径相同，
+     * 竞速拿到的就是"两次同样的慢"（实测 1456ms → 1533ms，无收益）。
+     *
+     * 不同 zone 的域名宣告的是**不同 anycast IP 段**，BGP 可能选到不同的机房。
+     * 于是第二路打备用域：如果两条路真的分开，竞速就能挑到快的那个机房；
+     * 如果还是没变化，就说明这段网络确实只有一条路，可以彻底收手。
+     *
+     * 正确性：og:url / 分享链接用的是常量 `SITE_ORIGIN`（apex），与请求 Host 无关；
+     * 会话 cookie 只按名字读取，也与 Host 无关（反代还会剥掉 Set-Cookie 的 Domain）。
+     */
+    const legOptions: OriginOptions = index === 1 && TARGET_BASE_ALT.length > 0
+      ? { ...options, signal: controller.signal, baseOverride: TARGET_BASE_ALT }
+      : { ...options, signal: controller.signal };
+    return fetchOrigin(attempt, url, legOptions).then((res) => {
       const value: OriginWinner = {
         res,
         label: labels[index] as "origin1" | "origin2",
