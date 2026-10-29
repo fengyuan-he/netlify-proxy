@@ -15,7 +15,7 @@
 // 9. 源站 private, no-cache 仍然可存：匿名 HTML 固定这么返回，拒绝它等于没有缓存；匿名性由第 5/7/8 条保证。
 // 10. 写缓存/命中路径都删掉 content-length：body 过了 tee、存、再取，任何 framing 变化都不该让旧长度生效。
 // 11. cache.put 失败立刻 cancel 掉 tee 的另一半：不消费的分支会把客户端分支一起反压住并涨内存。
-// 12. 条目 TTL(6min) 必须大于 stale-if-error 窗口(5min)：否则最需要兜底的那一刻条目正好过期。
+// 12. 条目 TTL(18min) 必须大于 stale-if-error 窗口(15min)：否则最需要兜底的那一刻条目正好过期。
 // 13. 超出兜底窗口也不马上 cancel 旧条目：先当 5xx/超时的最后副本，确认拿到新响应后再取消。
 // 14. 请求和响应都删逐跳头：connection / transfer-encoding 这类头再发一次会破坏 framing。
 // 15. Location 先 URL 解析再比对 host 才改写：相对、绝对、协议相对 //、http 方案全覆盖，且不会把 .evil.com 当自己人。
@@ -68,11 +68,12 @@ const TARGET_BASE: string = TARGET_URL
 const CACHE_VERSION = "v4";
 const CACHE_NAME = `zhuge-anon-${CACHE_VERSION}-${Deno.env.get("BUILD_ID") ?? "static"}`;
 
-// 匿名档窗口（保持不变）
-const FRESH_MS = 30_000; // 命中即回，不再回源
-const SWR_MS = 60_000; // 命中旧副本 + 后台刷新
-const HARD_STALE_MS = 5 * 60_000; // 只在源站 5xx/超时时才肯拿出来的最旧副本
-const STORE_TTL_S = 360; // 必须 > HARD_STALE_MS，否则兜底时条目已经没了
+// 匿名档窗口（2026-10-29 放大：批量探测 305 节点并发要能落在同一个热条目上）
+// 注意：这组常量是**匿名档专属**，成员档用下面独立的 USER_* 一组，改这里不影响成员档。
+const FRESH_MS = 300_000; // 5min：命中即回，不再回源
+const SWR_MS = 600_000; // 10min：命中旧副本 + 后台刷新
+const HARD_STALE_MS = 900_000; // 15min：只在源站 5xx/超时时才肯拿出来的最旧副本
+const STORE_TTL_S = 1_080; // 18min：必须 > HARD_STALE_MS，否则兜底时条目已经没了
 
 // 用户桶窗口：更宽松，但失效靠 epoch 而不是靠时间
 const USER_FRESH_MS = 120_000; // 120s
@@ -419,6 +420,22 @@ function isCacheableTarget(url: URL): boolean {
   return true;
 }
 
+/**
+ * 请求是否在「要页面」：`Accept` 含 `text/html` **或** 含通配媒体类型（星号/星号）都算。
+ *
+ * 为什么允许通配（2026-10-29 放宽，只放宽这一条）：通配是探测工具（itdog 这类 305 节点
+ * 并发的批量探活）、爬虫、curl 的默认 Accept，它们本来就不带 cookie、也拿不到任何个性化内容，
+ * 却因为「没写 text/html」被判成非页面请求而全部 bypass —— 305 个节点于是各自付一次冷启动。
+ * 安全性不靠这条判据兜底：带 cookie / authorization / range / upgrade 的请求在 isCacheable 里
+ * 仍然硬拒绝、永远进不了匿名桶，路径黑名单也不动，所以真实用户的登录态与个性化 HTML 绝不会
+ * 被共享条目命中；带 Set-Cookie 的响应同样一律不写缓存（第 8 条）。
+ */
+function acceptsHtml(header: string): boolean {
+  const value = header.trim().toLowerCase();
+  if (value.length === 0) return false;
+  return value.includes("text/html") || value.includes("*/*");
+}
+
 function isCacheable(request: Request, url: URL): boolean {
   if (request.method !== "GET") return false;
 
@@ -426,7 +443,8 @@ function isCacheable(request: Request, url: URL): boolean {
   if (headers.has("cookie") || headers.has("authorization") || headers.has("range") || headers.has("upgrade")) {
     return false;
   }
-  if (!(headers.get("accept") ?? "").includes("text/html")) return false;
+  // `text/html` 或 `*/*` 都算页面请求（见 acceptsHtml 里的安全说明）。
+  if (!acceptsHtml(headers.get("accept") ?? "")) return false;
   // 缓存条目固定 gzip，只服务能解 gzip 的客户端。
   if (!acceptsGzip(headers.get("accept-encoding") ?? "")) return false;
 
@@ -448,7 +466,7 @@ function isMemberCacheable(request: Request, url: URL): boolean {
 
 /**
  * 三档分流的唯一入口。
- * anon：GET + 无 cookie + Accept 含 text/html + 接受 gzip（完全沿用原有判定）
+ * anon：GET + 无 cookie + Accept 含 text/html 或通配媒体类型（安全说明见 acceptsHtml）+ 接受 gzip
  * user：GET + 带 zhuge_session（是否入桶由源站 X-Zhuge-Cache-Tier 决定）
  * bypass：其余全部
  */
