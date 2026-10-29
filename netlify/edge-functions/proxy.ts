@@ -500,6 +500,8 @@ type Trace = {
   iso: string;
   /** 2026-10-29（第 60 条）：成员档本次用到的缓存版本号，只进 trace（诊断用）。 */
   epoch?: number;
+  /** 2026-10-30（第 63 条）：每一条竞速腿各自的到达耗时（键 origin1..4），只进 trace。 */
+  legMs?: Record<string, number>;
   /** 本 isolate 内的请求序号（第 51 条）：只进 trace 日志，用来区分排队与换 isolate。 */
   seq: number;
   /** 缓存查询结束；直连档没有缓存查询，取 t0。 */
@@ -683,7 +685,12 @@ function reportTrace(
       // 只要把 (region, iso, epoch, cache) 放在同一行，就能一眼看出三者是否耦合。
       iso: trace.iso,
       epoch: trace.epoch ?? 0,
-      diag: trace.tier === "user",
+      /**
+       * 2026-10-30（第 63 条）：每条腿各自的到达耗时，形如 `o1:76,o2:95,o4:71`。
+       * 只记赢家（原来的 up）回答不了"谁救了谁"——不知道输家是慢 10ms 还是慢 3 秒。
+       */
+      legs: formatLegMs(trace.legMs),
+      diag: trace.tier === "user" || raceedAnon(trace),
     });
     // 一行结构化日志：Netlify 函数日志里 grep `[trace]` 就能直接看出慢在哪一段。
     // region = 本函数跑在哪个区域（Netlify 调度结果）；colo = CF 服务源站的那个机房。
@@ -795,6 +802,26 @@ async function readBodyCapped(
     offset += chunk.byteLength;
   }
   return bytes;
+}
+
+/**
+ * 2026-10-30（第 63 条）：把每条腿的到达耗时压成一行紧凑字符串（o1:76,o2:95,o4:71）。
+ * 空对象返回空串，避免日志里出现 legs= 后面什么都没有。
+ */
+function formatLegMs(legMs?: Record<string, number>): string {
+  if (legMs === undefined) return "";
+  const parts: string[] = [];
+  for (const [label, ms] of Object.entries(legMs)) parts.push(label.replace("origin", "o") + ":" + ms);
+  return parts.join(",");
+}
+
+/**
+ * 2026-10-30（第 63 条）：这一发匿名请求**是否真的跑过竞速**。
+ * 用途：让它不受"慢请求 / 2% 采样"过滤地上报，从而拿到无偏的四路胜率。
+ * （站主指出：origin4 赢了并因此变快的那些请求，恰恰因为"不慢"而不进日志 —— 幸存者偏差。）
+ */
+function raceedAnon(trace: Trace): boolean {
+  return trace.tier === "anon" && typeof trace.race === "string" && trace.race.startsWith("origin");
 }
 
 function waitUntil(ctx: Context, promise: Promise<unknown>): void {
@@ -1322,6 +1349,8 @@ type OriginRace = {
   winner: Promise<OriginWinner>;
   /** 缓存先赢 / 已经不用回源：立刻 abort 两路里还没回来的那些（缓存本身没法 abort，忽略即可）。 */
   abort: () => void;
+  /** 2026-10-30：每一条腿各自的到达耗时（键是 origin1..4）；没到就被 abort 的不会出现。 */
+  legMs: Record<string, number>;
 };
 
 /**
@@ -1338,6 +1367,7 @@ function startOriginRace(request: Request, url: URL, options: OriginOptions): Or
   const controllers: AbortController[] = Array.from({ length: legCount }, () => new AbortController());
   let decided = false;
   let abandoned = false;
+  const legMs: Record<string, number> = {};
   let settledWinner: OriginWinner | null = null;
 
   const legs: Array<Promise<OriginWinner>> = controllers.map((controller, index) => {
@@ -1368,6 +1398,14 @@ function startOriginRace(request: Request, url: URL, options: OriginOptions): Or
         label: (labels[index] ?? "origin1") as "origin1" | "origin2" | "origin3" | "origin4",
         ms: Math.max(0, Date.now() - startedAt),
       };
+      /**
+       * 2026-10-30：记录**每一条腿各自的到达时间**（含输掉的那些）。
+       *
+       * 只记赢家（原来的 `tUp`）回答不了"谁救了谁"——不知道输家是比赢家慢
+       * 10ms 还是慢 3 秒，也不知道哪条腿根本没到就被 abort 了。
+       * 这份数据在 trace 里落成 `legs=o1:76,o2:95,o4:71` 这样的字段。
+       */
+      if (legMs !== null) legMs[value.label] = value.ms;
       if (decided) {
         // 已经有人赢了：这一路白跑，body 立刻取消，别留一条没人读的流。
         void discard(res);
@@ -1394,6 +1432,7 @@ function startOriginRace(request: Request, url: URL, options: OriginOptions): Or
 
   return {
     winner,
+    legMs,
     abort: () => {
       abandoned = true;
       for (const controller of controllers) controller.abort();
@@ -2402,6 +2441,7 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: T
   //    能走到本档的一定是 GET（classifyTier 拦掉了其他方法），所以这里不用再判方法。
   trace.tFetch = Date.now();
   const race = startOriginRace(request, url, { forceGzip: true, canonicalReferer: true });
+  trace.legMs = race.legMs;
 
   // ② 缓存查询与它并行；probe 兜成永不 reject（任何意外都退化成「这一档没缓存」）。
   const probeP: Promise<CacheProbe> = probeAnonymous(request, url, ctx, trace).catch(
@@ -2542,6 +2582,7 @@ async function serveMember(request: Request, url: URL, ctx: Context, trace: Trac
   // ① 两路回源立刻出发（uidHash 只是缓存键的一部分，回源不需要它）。
   trace.tFetch = Date.now();
   const race = startOriginRace(request, url, { forceGzip: true, canonicalReferer: true });
+  trace.legMs = race.legMs;
 
   // ② 缓存查询与它并行；probe 兜成永不 reject（任何意外都退化成「这一档没缓存」）。
   const probeP: Promise<CacheProbe> = probeMember(request, url, ctx, trace, uidHash, tag).catch(
@@ -2650,6 +2691,7 @@ async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Re
   // GET（bypass 档）：没有缓存可查，但两路回源照样竞速 —— 慢的那一路不再拖住用户。
   trace.tFetch = Date.now();
   const race = startOriginRace(request, url, { forceGzip: false, canonicalReferer: false });
+  trace.legMs = race.legMs;
   let winner: OriginWinner;
   try {
     winner = await race.winner;
@@ -3066,7 +3108,22 @@ export default async function handler(request: Request, ctx: Context): Promise<R
        * 成本：全站只有 154 个会员账号，成员档请求量极小（一天几十条），
        * 而且只在排查窗口内需要，随时可以把这一行条件去掉。
        */
-      const diag = trace.tier === "user";
+      /**
+       * 2026-10-30：**匿名档只要真的跑了竞速（race = origin1~4）就上报**，不看快慢。
+       *
+       * 为什么必须这么做（站主 2026-10-30 指出我的一个逻辑错误）：
+       * 之前只有"慢请求 + 2% 采样"才记，于是 trace 里只剩慢的竞速。
+       * 我据此说"origin4 在 113 次慢竞速里一次没赢 ⇒ 它救不了尾巴"——
+       * **这是幸存者偏差**：origin4 赢了的那些请求往往因此变快，**根本不进日志**。
+       * 用"被过滤后的样本"去推断"谁在救谁"，方向就错了。
+       *
+       * 现在把"真的跑了竞速的匿名请求"全部记下来（不看耗时），
+       * 攒几天就能得到**无偏**的四路胜率，以及每一条腿各自的耗时。
+       *
+       * 成本：匿名未命中在他现在的流量下约每天几百行，可忽略。
+       */
+      const raced = trace.tier === "anon" && typeof trace.race === "string" && trace.race.startsWith("origin");
+      const diag = trace.tier === "user" || raced;
       const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS || cacheMs > TRACE_UP_SLOW_MS;
       if (diag || slow || sample) {
         reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs, cacheMs, raceName);
@@ -3103,6 +3160,7 @@ export default async function handler(request: Request, ctx: Context): Promise<R
     const keySuffix = cacheIdPath(url).slice(0, 160);
     const headers = new Headers(withTiming.headers);
     headers.set("x-proxy-key", keySuffix);
+
     /**
      * 2026-10-29（第 60 条）：区域 / isolate 诊断头。
      *
