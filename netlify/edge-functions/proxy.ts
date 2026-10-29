@@ -454,6 +454,8 @@ type Trace = {
   t0: number;
   /** 本 isolate 的随机标识（第 51 条）：只进 trace 日志，绝不进响应头。 */
   iso: string;
+  /** 2026-10-29（第 60 条）：成员档本次用到的缓存版本号，只进 trace（诊断用）。 */
+  epoch?: number;
   /** 本 isolate 内的请求序号（第 51 条）：只进 trace 日志，用来区分排队与换 isolate。 */
   seq: number;
   /** 缓存查询结束；直连档没有缓存查询，取 t0。 */
@@ -630,6 +632,14 @@ function reportTrace(
       // 「逐用户缓存有没有生效」**——`cache` 字段里匿名命中和登录命中都记 hit。
       // 源站 /api/trace 的白名单已经加了这个字段。
       tier: trace.tier ?? "?",
+      // 2026-10-29（第 60 条）：区域 / isolate / epoch 三件套，用于验证
+      // 「epoch 为什么会在 0 → 2 → 1 之间跳」。
+      // 外部评估给出的假设：Netlify 的 Cache API **按区域存储、不跨区复制**，
+      // 每个区域各有一份 epoch；请求落到哪个区域就读到哪个值。
+      // 只要把 (region, iso, epoch, cache) 放在同一行，就能一眼看出三者是否耦合。
+      iso: trace.iso,
+      epoch: trace.epoch ?? 0,
+      diag: trace.tier === "user",
     });
     // 一行结构化日志：Netlify 函数日志里 grep `[trace]` 就能直接看出慢在哪一段。
     // region = 本函数跑在哪个区域（Netlify 调度结果）；colo = CF 服务源站的那个机房。
@@ -2321,6 +2331,7 @@ async function probeMember(
     cache = openedCache;
     key = cacheKey;
     observe = { user: tag, epoch };
+    trace.epoch = epoch; // 第 60 条：只进 trace，用于诊断 "epoch 为什么跳"
 
     const tMatch = Date.now();
     const matched = await openedCache.match(cacheKey);
@@ -2887,8 +2898,18 @@ export default async function handler(request: Request, ctx: Context): Promise<R
       // 于是把 Netlify 日志和 ip_logs 刷满 `up=15002ms` 的假"慢请求"，真正的问题被挤掉。
       // 这些端点单独排除，不参与上报。
       if (LONG_POLL_PATHS.has(url.pathname)) return;
+      /**
+       * 2026-10-29（第 60 条）：**成员档一律上报**，不受"慢请求 / 2% 采样"限制。
+       *
+       * 为什么：站主无法每刷一次就手工复制一次响应头。"命中 vs 未命中"在成员档
+       * 现在是最需要看的东西，而它恰好又快又安静——采样几乎永远抽不到。
+       *
+       * 成本：全站只有 154 个会员账号，成员档请求量极小（一天几十条），
+       * 而且只在排查窗口内需要，随时可以把这一行条件去掉。
+       */
+      const diag = trace.tier === "user";
       const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS || cacheMs > TRACE_UP_SLOW_MS;
-      if (slow || sample) {
+      if (diag || slow || sample) {
         reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs, cacheMs, raceName);
       }
     };
