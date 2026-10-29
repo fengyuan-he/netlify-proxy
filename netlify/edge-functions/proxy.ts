@@ -13,7 +13,8 @@
 //    （带 zhuge_session 的 GET 只可能走用户桶，两档键空间不相交，见第 25 条。）
 // 8. 响应带 Set-Cookie 时一律不写缓存：这是「本次响应有状态」的最强信号（用户桶同样适用）。
 // 9. 源站 private, no-cache 仍然可存：匿名 HTML 固定这么返回，拒绝它等于没有缓存；匿名性由第 5/7/8 条保证。
-// 10. 写缓存/命中路径都删掉 content-length：body 过了 tee、存、再取，任何 framing 变化都不该让旧长度生效。
+// 10. 写缓存/命中路径都删掉 content-length：body 已由我们自己重新构造，帧长交给运行时；
+//     条目里另存 x-proxy-bytes 记录"写进去的真实字节数"，命中时用它做完整性校验（第 48 条）。
 // 11. cache.put 失败立刻 cancel 掉 tee 的另一半：不消费的分支会把客户端分支一起反压住并涨内存。
 // 12. 条目 TTL(18min) 必须大于 stale-if-error 窗口(15min)：否则最需要兜底的那一刻条目正好过期。
 // 13. 超出兜底窗口也不马上 cancel 旧条目：先当 5xx/超时的最后副本，确认拿到新响应后再取消。
@@ -66,8 +67,22 @@
 // 43. 写入门槛比 HTML 严：200 + content-type 白名单 + 无 Set-Cookie；401/403/404、HTML 错误页、
 //     application/octet-stream 一律交给原来的 bypass 收尾 —— 宁可多回源一次，也不把一次失败固化 30 天。
 // 44. 硬过期（age > SWR 30 天）先删条目再回源：这才是真的「重取」，否则条目永远占着 match 的位置。
-// 45. 带 content-encoding 的条目只在客户端声明接受该编码时回放：键里没有 accept-encoding，
-//     否则不认 br/gzip 的客户端会拿到解不开的字节（回源一次总比给错字节好）。
+// 45. 静态条目只允许 identity（不带 content-encoding）：键里没有 accept-encoding 维度，压缩体一旦
+//     被任何一层按「无编码」回放，浏览器解出来就是坏图。压缩交给外层 CDN 按客户端能力现场做。
+//
+// ── 静态档完整性修复（2026-10-29 线上事故）───────────────────────────────────
+// 46. 事故复盘：线上 comet.svg 的条目/回放体是 **完整的 zstd 体**（1715 → 774 字节，解压后逐字节等于源站），
+//     不是 tee 截断；坏在它被**按 identity 回放**（响应里没有 content-encoding）。静态键没有编码维度，
+//     只要压缩体在某一层丢了 CE 头，浏览器就会把 774 字节压缩数据当 SVG 解析 → 头像框全破。
+//     所以静态档回源**强制 identity**，缓存里只存原始字节，客户端拿到的也永远是原始字节。
+//     压缩交给外层 CDN 按客户端 Accept-Encoding 现场做（它会正确写上自己用的 CE）。
+// 47. 写缓存不再 tee：先把 body 完整读成一段字节（≤ 2MiB），再用同一段字节分别构造「写缓存」和
+//     「给客户端」两个**独立 Response**。tee 的两半共享底层流，任何一半被 cancel/abort 都可能让另一半
+//     读不完；独立字节没有这个耦合，也不再有「哪条分支先被放掉」的时序问题。
+// 48. 命中前必须把条目**完整读出来校验**：字节数必须等于条目里记的 x-proxy-bytes，且不能带
+//     content-encoding；任何一项不满足都当 miss 并删除条目（宁可不缓存，也不能回放坏条目）。
+// 49. 校验失败一律不写缓存：content-length 对不上（源站截断）、超过 2MiB、读失败 → 不缓存；
+//     截断的 body 直接 502，绝不把半截当 200 发出去。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -108,12 +123,19 @@ const USER_STORE_TTL_S = 720; // 必须 > USER_HARD_STALE_MS
 const EPOCH_TTL_S = 7 * 24 * 3_600; // epoch 条目必须活得比任何页面条目都久
 
 // ── 第四档（静态资源）窗口：与上面两组完全独立，改这里不影响 anon / user 任何一档 ──
-const STATIC_CACHE_VERSION = "v1";
+// v2（2026-10-29）：条目语义从「源站给什么编码就存什么」改成「只存 identity」，
+// 旧的 v1 条目带压缩体，必须物理隔离；换版本号后即使 BUILD_ID 缺失（回落到 "static"）也读不到旧条目。
+const STATIC_CACHE_VERSION = "v2";
 // 独立 cache 名：静态档的条目与 anon/user 的 HTML 条目物理隔离，键空间也互不可见。
 const STATIC_CACHE_NAME = `zhuge-static-${STATIC_CACHE_VERSION}-${BUILD_ID}`;
 const STATIC_FRESH_MS = 7 * 24 * 3_600_000; // 7 天：纯新鲜窗口（分档见 staticAgeOf）
 const STATIC_SWR_MS = 30 * 24 * 3_600_000; // 30 天：SWR 窗口上界，同时就是硬过期点
 const STATIC_STORE_TTL_S = 30 * 24 * 3_600; // 30 天：= SWR；硬过期后由下一次请求删掉重取
+// 单个静态条目的大小上限：超过就不进缓存、直接回源透传（读入内存的上限，见第 47/49 条）。
+// 超过它的资源一律不缓冲 —— 静态档只缓存小文件，大图不值得为它把一个 isolate 的内存吃掉。
+const STATIC_MAX_CACHE_BYTES = 2 * 1024 * 1024;
+// 条目内部记录「实际写进缓存的字节数」：命中时用它校验完整性（不依赖会被框架/平台改写的 content-length）。
+const STATIC_BYTES = "x-proxy-bytes";
 // 键的内部固定 origin：不含 cookie / theme / epoch，也不与 cache.invalid 的两种 HTML 键重叠。
 const STATIC_KEY_ORIGIN = "https://static-cache.internal";
 // 条目里没记到源站原值时的兜底（源站对这些资源实际发的是 immutable 1 年）。
@@ -382,6 +404,64 @@ async function discard(res: Response | null | undefined): Promise<void> {
   }
 }
 
+/** 解析长度声明：只认安全的非负整数（`1715`、`"1715"`），其它一律当"没有声明"。 */
+function parseDeclaredLength(raw: string | null): number | null {
+  if (raw === null) return null;
+  const value = Number(raw.trim());
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * 把整条 body 读成一段字节（第 47 条）。
+ * 超过 cap / 中途出错 / 被取消一律返回 null —— **绝不返回半截**，
+ * 调用方只能据此判定「这条不能缓存 / 这个条目是坏的」。
+ */
+async function readBodyCapped(
+  body: ReadableStream<Uint8Array>,
+  cap: number,
+): Promise<Uint8Array<ArrayBuffer> | null> {
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = body.getReader();
+  } catch {
+    return null; // 已被锁定 / 已消费：当读失败处理
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = next.value;
+      if (chunk === undefined) continue;
+      total += chunk.byteLength;
+      if (total > cap) {
+        try {
+          await reader.cancel();
+        } catch {
+          // 已经关闭 / 被锁定：无所谓，返回 null 就够
+        }
+        return null;
+      }
+      chunks.push(chunk);
+    }
+  } catch {
+    try {
+      await reader.cancel();
+    } catch {
+      // 同上
+    }
+    return null;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 function waitUntil(ctx: Context, promise: Promise<unknown>): void {
   // 统一收敛成 Promise<void>：兼容 Context.waitUntil 的两种签名（Promise<void> / Promise<unknown>）。
   const guarded: Promise<void> = Promise.resolve(promise)
@@ -408,25 +488,6 @@ function acceptsGzip(header: string): boolean {
     const segments = part.split(";");
     const coding = (segments[0] ?? "").trim().toLowerCase();
     if (coding !== "gzip" && coding !== "*") continue;
-    let rejected = false;
-    for (let i = 1; i < segments.length; i += 1) {
-      const pair = (segments[i] ?? "").split("=");
-      if ((pair[0] ?? "").trim().toLowerCase() === "q" && Number(pair[1]) === 0) rejected = true;
-    }
-    if (!rejected) return true;
-  }
-  return false;
-}
-
-/** 与 acceptsGzip 同一套判据（精确 token 或 `*`，`q=0` 视为拒绝），但可以问任意编码。 */
-function acceptsCoding(header: string, coding: string): boolean {
-  const wanted = coding.trim().toLowerCase();
-  if (wanted.length === 0) return true;
-  if (header.trim().length === 0) return false;
-  for (const part of header.split(",")) {
-    const segments = part.split(";");
-    const token = (segments[0] ?? "").trim().toLowerCase();
-    if (token !== wanted && token !== "*") continue;
     let rejected = false;
     for (let i = 1; i < segments.length; i += 1) {
       const pair = (segments[i] ?? "").split("=");
@@ -579,21 +640,13 @@ function isStaticContentType(headers: Headers): boolean {
 }
 
 /**
- * 条目能不能回放给这个客户端（第 45 条）：条目带 content-encoding 时，
- * 只有客户端声明接受该编码才回放；判不了就当作不能回放。
+ * 静态条目能不能回放（第 45/46 条）：条目必须是 identity。
+ * 带 content-encoding 的条目（旧版本写进去的压缩体、或外来条目）对本函数**永远**不可回放 ——
+ * 静态键里没有编码维度，留着它只会在下一次命中时被当成原始字节发给客户端。
  */
-function staticEntryReplayable(hit: Response, request: Request): boolean {
+function staticEntryReplayable(hit: Response): boolean {
   const encoding = (hit.headers.get("content-encoding") ?? "").trim().toLowerCase();
-  if (encoding.length === 0 || encoding === "identity") return true;
-  if (
-    encoding !== "gzip" &&
-    encoding !== "br" &&
-    encoding !== "deflate" &&
-    encoding !== "zstd"
-  ) {
-    return false;
-  }
-  return acceptsCoding(request.headers.get("accept-encoding") ?? "", encoding);
+  return encoding.length === 0 || encoding === "identity";
 }
 
 /**
@@ -763,6 +816,11 @@ async function bumpEpochForRequest(request: Request): Promise<void> {
 type OriginOptions = {
   /** 强制 accept-encoding: gzip（缓存档必须，保证桶里只有一种编码）。 */
   forceGzip: boolean;
+  /**
+   * 强制 accept-encoding: identity（静态档必须，见第 46 条）。
+   * 静态条目的键里没有编码维度，只有 identity 字节才能回放给任何客户端。
+   */
+  forceIdentity?: boolean;
   /** 用「自身地址」做 referer：确定性，避免把别处的来源写进缓存。 */
   canonicalReferer: boolean;
   /** 竞速时由每一路自己的 controller 提供：外部 abort 会连带 abort 这里 15s 的超时定时器。 */
@@ -790,6 +848,12 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
     headers.delete("if-none-match");
     headers.delete("if-modified-since");
     headers.delete("if-range");
+  }
+
+  if (options.forceIdentity === true) {
+    // 静态档：只要原始字节（第 46 条）。压缩由外层 CDN 按客户端的 Accept-Encoding 现场做，
+    // 缓存里绝不出现第二套编码 —— 否则键里没有编码维度，迟早把压缩体发给不认它的客户端。
+    headers.set("accept-encoding", "identity");
   }
 
   const origin = request.headers.get("origin");
@@ -1609,18 +1673,22 @@ async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Re
 type StaticStorePlan = { cache: Cache; key: Request };
 
 /**
- * 静态档的回源收尾。
- * 写入条件（第 4 条）：status 200 + content-type 白名单 + **没有任何 Set-Cookie**。
+ * 静态档的回源收尾（第 43/46/47/49 条）。
+ *
+ * 写入条件：status 200 + content-type 白名单 + **没有任何 Set-Cookie** + **identity 字节** +
+ * 长度已知且 0 < content-length ≤ STATIC_MAX_CACHE_BYTES。
  * 形状不合格的那一份（401/403/404、HTML 错误页、octet-stream、带 Set-Cookie）**原样交给
- * processOrigin(plan=null)** —— 也就是改动前 bypass 档走的那段代码，状态码、响应头、
- * Set-Cookie 去 Domain、Location / CORS 改写全部逐字一致（第 43 条）。
+ * processOrigin(plan=null)** —— 状态码、响应头、Set-Cookie 去 Domain、Location / CORS 改写逐字一致。
+ *
+ * 要写缓存时**不再 tee**：先把 body 完整读成一段字节并和 content-length 对账，再用这同一段字节
+ * 分别构造「写缓存」与「给客户端」两个独立 Response。任何一半被取消都不会影响另一半。
  */
-function processStaticOrigin(
+async function processStaticOrigin(
   res: Response,
   requestUrl: URL,
   proxyOrigin: string,
   plan: StaticStorePlan | null,
-): OriginOutput {
+): Promise<OriginOutput> {
   const cacheableShape =
     res.status === 200 &&
     res.body !== null &&
@@ -1631,22 +1699,35 @@ function processStaticOrigin(
     return processOrigin(res, requestUrl, proxyOrigin, null, "GET");
   }
 
-  // 形状合格但这次没有写入计划（缓存那一路还没跑完 / Cache API 不可用）：
-  // 照实标 static-miss（这一次确实没从缓存拿到），只是不写。
-  if (plan === null) {
-    const out = buildResponseHeaders(res, requestUrl, "GET");
-    rewriteLocation(out, proxyOrigin);
-    rewriteCors(out, proxyOrigin);
-    out.set(CACHE_STATE, "static-miss");
-    return { response: withBody(res, out) };
-  }
-
   const out = buildResponseHeaders(res, requestUrl, "GET");
   rewriteLocation(out, proxyOrigin);
   rewriteCors(out, proxyOrigin);
 
-  const [toClient, toCache] = res.body.tee();
-  out.delete("content-length"); // 同 HTML 档：body 过了 tee，旧长度不该再约束这条流
+  // 静态键里没有 accept-encoding 维度（第 45 条），所以条目只允许是 identity。
+  // 回源已经强制 identity；万一源站仍然回了压缩体，这一次不缓存、原样透传（CE 头不能剥）。
+  const encoding = (res.headers.get("content-encoding") ?? "").trim().toLowerCase();
+  const encoded = encoding.length > 0 && encoding !== "identity";
+  const declared = parseDeclaredLength(res.headers.get("content-length"));
+  // 没有 content-length / 空 body / 超过上限：不缓冲也不缓存，直接透传。
+  // （静态档只缓存「长度已知且足够小」的文件；宁可不缓存，也不猜长度。）
+  const writable =
+    plan !== null && !encoded && declared !== null && declared > 0 && declared <= STATIC_MAX_CACHE_BYTES;
+
+  if (!writable) {
+    // 形状合格但这次不写：缓存那一路还没跑完 / 缓存不可用 / 编码或长度不合格。
+    out.set(CACHE_STATE, plan === null ? "static-miss" : "static-bypass");
+    return { response: withBody(res, out) };
+  }
+
+  // 完整读入（上限 2MiB）。读失败 / 超限 / 中途断开都是 null，绝不拿半截去写缓存。
+  const bytes = await readBodyCapped(res.body, STATIC_MAX_CACHE_BYTES);
+  if (bytes === null || bytes.byteLength !== declared) {
+    // 源站 body 和 content-length 对不上（截断 / 超限）：不缓存，也不能把半截当 200 发出去。
+    void discard(res);
+    return { response: text(502, "Bad Gateway") };
+  }
+
+  out.delete("content-length"); // body 已是内存里的完整字节，旧的 framing 不再适用
   out.set(CACHE_STATE, "static-miss");
 
   // 条目里另存源站原始 cache-control（浏览器下次别再经过本函数），TTL 只用来定平台淘汰时间。
@@ -1654,23 +1735,25 @@ function processStaticOrigin(
   storeHeaders.set(ORIGIN_CC, out.get("cache-control") ?? "");
   storeHeaders.set("cache-control", `public, max-age=${STATIC_STORE_TTL_S}`);
   storeHeaders.set(BORN, String(Date.now()));
+  storeHeaders.set(STATIC_BYTES, String(bytes.byteLength)); // 命中时唯一可信的长度（第 48 条）
+  storeHeaders.set("content-length", String(bytes.byteLength)); // 标准头兜底：平台若丢了自定义头，还能用它对账
   storeHeaders.delete(CACHE_STATE);
   storeHeaders.delete(CACHE_AGE);
 
   let stored: Promise<void> | undefined;
   try {
+    // 写缓存吃的是独立副本（同一段已校验的字节），不再和客户端那份共享底层流。
     stored = plan.cache
-      .put(plan.key, new Response(toCache, { status: 200, statusText: res.statusText, headers: storeHeaders }))
+      .put(plan.key, new Response(bytes, { status: 200, statusText: res.statusText, headers: storeHeaders }))
       .catch(() => {
-        // put 失败后没人读 toCache：必须主动取消，否则客户端分支会被反压拖住。
-        void toCache.cancel().catch(() => {});
+        // 写失败只是这次没缓存；客户端那份是独立字节，不受影响。
       });
   } catch {
-    void toCache.cancel().catch(() => {});
+    // cache.put 同步抛错（例如缓存已被关闭）同样不能影响客户端响应
   }
 
   return {
-    response: new Response(toClient, { status: 200, statusText: res.statusText, headers: out }),
+    response: new Response(bytes, { status: 200, statusText: res.statusText, headers: out }),
     stored,
   };
 }
@@ -1684,6 +1767,7 @@ function fromStaticCache(hit: Response, ageMs: number): Response {
   const originCacheControl = headers.get(ORIGIN_CC);
   headers.delete(ORIGIN_CC);
   headers.delete(BORN);
+  headers.delete(STATIC_BYTES); // 内部长度标记绝不外泄（正常路径已在 readStaticEntry 删过一次）
   headers.set(
     "cache-control",
     originCacheControl !== null && originCacheControl.length > 0 ? originCacheControl : STATIC_DEFAULT_CC,
@@ -1693,15 +1777,52 @@ function fromStaticCache(hit: Response, ageMs: number): Response {
   return withBody(hit, headers);
 }
 
-/** 静态档的缓存探测结果：hit 一定是「这个客户端能回放」的那一种；plan 用来回源后写回。 */
+/** 静态档的缓存探测结果：hit 一定是「完整且 identity」的那一种；plan 用来回源后写回。 */
 type StaticProbe = { hit?: { res: Response; ageMs: number }; plan: StaticStorePlan | null };
+
+/**
+ * 命中前的完整性校验（第 48 条）：把条目完整读成字节，再和条目里记的 x-proxy-bytes 对账。
+ * 任何一项不满足（读失败 / 空 / 超过 2MiB / 长度不符）都当 miss 并删掉条目 ——
+ * 坏条目比没有缓存更糟：它会在 30 天里持续把坏字节发给所有人。
+ */
+async function readStaticEntry(
+  matched: Response,
+  cache: Cache,
+  key: Request,
+): Promise<Response | null> {
+  const declared = parseDeclaredLength(
+    matched.headers.get(STATIC_BYTES) ?? matched.headers.get("content-length"),
+  );
+  const bytes = matched.body === null ? null : await readBodyCapped(matched.body, STATIC_MAX_CACHE_BYTES);
+  if (bytes === null || bytes.byteLength === 0) {
+    try {
+      await cache.delete(key);
+    } catch {
+      // 删不掉也照样当 miss：本次绝不回放它
+    }
+    return null;
+  }
+  if (declared !== null && declared !== bytes.byteLength) {
+    try {
+      await cache.delete(key);
+    } catch {
+      // 同上
+    }
+    return null;
+  }
+
+  const headers = new Headers(matched.headers);
+  headers.delete(STATIC_BYTES);
+  headers.delete("content-length"); // body 已是内存里的完整字节，长度交给运行时
+  return new Response(bytes, { status: 200, statusText: matched.statusText, headers });
+}
 
 /**
  * 静态档缓存探测（与那唯一一路回源**并行**跑，见 serveStatic）：
  * 打不开 / match 抛错一律降级为「没有缓存」，本次不回写、直接单路回源，绝不 5xx。
- * 命中但条目编码这个客户端不认 → 不回放、也不删条目（对别的客户端它仍然有效），本次按本次编码重写。
+ * 命中必须同时满足：不是硬过期 + identity + 完整性校验通过（第 46/48 条），否则删条目当 miss。
  */
-async function probeStatic(request: Request, url: URL, ctx: Context, trace: Trace): Promise<StaticProbe> {
+async function probeStatic(url: URL, ctx: Context, trace: Trace): Promise<StaticProbe> {
   try {
     const openedCache = await caches.open(STATIC_CACHE_NAME);
     const cacheKey = buildStaticCacheKey(url);
@@ -1715,19 +1836,18 @@ async function probeStatic(request: Request, url: URL, ctx: Context, trace: Trac
 
       if (age === "expired") {
         // 硬过期（≥ SWR 30 天）：取消 body 后删条目，回源重取（第 44 条）。
-        // 这里**不 await** discard：body 的 cancel 在某些运行时（tee 出来的流）要等另一分支一起取消，
-        // 探测路径绝不能因为「放掉一条流」而慢下来 —— 那正是要躲开的 cacheMs 卡顿。
+        // 这里**不 await** discard：放掉一条流不该出现在探测的关键路径上。
         void discard(matched);
         waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
-      } else if (staticEntryReplayable(matched, request)) {
-        // fresh（< 7 天）与 swr（7~30 天）两档都直接回放、都标 static-hit：
-        // 静态资源是 immutable 的，swr 段的旧副本与源站逐字节相同，所以这一档**不发起后台刷新**
-        // （与 HTML 两档的 refresh 不同）；条目的「新旧」对外只看 x-proxy-age。
-        return { hit: { res: matched, ageMs }, plan: { cache: openedCache, key: cacheKey } };
-      } else {
-        // 条目是 gzip/br 而客户端没声明接受：这次不回放（第 45 条），回源后按本次编码重写。
-        // 同样不 await：取消只是一条流的清理，不该出现在关键路径上。
+      } else if (!staticEntryReplayable(matched)) {
+        // 压缩体条目对本函数永远不可回放（第 46 条）：删掉，本次按 miss 重取。
         void discard(matched);
+        waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
+      } else {
+        // fresh（< 7 天）与 swr（7~30 天）两档都直接回放、都标 static-hit（静态资源 immutable，
+        // 这一档不发起后台刷新）；回放前必须过完整性校验，坏条目在这里被删掉并当 miss。
+        const hit = await readStaticEntry(matched, openedCache, cacheKey);
+        if (hit !== null) return { hit: { res: hit, ageMs }, plan: { cache: openedCache, key: cacheKey } };
       }
     }
     return { plan: { cache: openedCache, key: cacheKey } };
@@ -1740,15 +1860,16 @@ async function probeStatic(request: Request, url: URL, ctx: Context, trace: Trac
 
 /**
  * 静态档的写缓存收尾：processStaticOrigin 出响应，stored 挂到 waitUntil 上。
+ * processStaticOrigin 现在是 async（要先把 body 读成字节），所以这里也要 await。
  */
-function finishStaticOrigin(
+async function finishStaticOrigin(
   res: Response,
   url: URL,
   proxyOrigin: string,
   plan: StaticStorePlan | null,
   ctx: Context,
-): Response {
-  const { response, stored } = processStaticOrigin(res, url, proxyOrigin, plan);
+): Promise<Response> {
+  const { response, stored } = await processStaticOrigin(res, url, proxyOrigin, plan);
   if (stored !== undefined) waitUntil(ctx, stored);
   return response;
 }
@@ -1762,9 +1883,9 @@ function finishStaticOrigin(
  * 与 HTML 档的差别只有一条：回源是**单路**（第 41 条），不是两路。白跑一次图片回源 = 一次 R2 读、
  * 零 D1，所以这条路径也享受「缓存卡住不拖住用户」，但不会把回源量乘二。
  *
- *   · age < FRESH(7d)         → 回放，x-proxy-cache: static-hit
+ *   · age < FRESH(7d)         → 回放（先过完整性校验），x-proxy-cache: static-hit
  *   · FRESH ≤ age < SWR(30d)  → 同样回放（内容 immutable，不值得为它再回源一次），仍标 static-hit
- *   · age ≥ SWR / 编码不匹配  → 删条目，回源重取
+ *   · age ≥ SWR / 非 identity / 完整性校验失败 → 删条目，回源重取
  *   · 未命中                  → 单路回源 → 写缓存，x-proxy-cache: static-miss
  *
  * 全程不报 trace（第 42 条），也不碰 epoch（静态资源与登录态无关）。
@@ -1779,6 +1900,7 @@ async function serveStatic(request: Request, url: URL, ctx: Context, trace: Trac
   trace.tFetch = Date.now();
   const originP: Promise<Response> = fetchOrigin(request, url, {
     forceGzip: false,
+    forceIdentity: true, // 静态条目只存 identity（第 46 条）
     canonicalReferer: false,
     signal: controller.signal,
   }).then((res) => {
@@ -1793,7 +1915,7 @@ async function serveStatic(request: Request, url: URL, ctx: Context, trace: Trac
   });
 
   // ② 缓存探测与它同时开跑；probe 兜成永不 reject（任何意外都退化成「这一档没缓存」）。
-  const probeP: Promise<StaticProbe> = probeStatic(request, url, ctx, trace).catch(
+  const probeP: Promise<StaticProbe> = probeStatic(url, ctx, trace).catch(
     (): StaticProbe => ({ plan: null }),
   );
   trace.cacheSettled = probeP.then(
@@ -1909,11 +2031,15 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   const raceName = trace.race ?? "none";
   const rawCacheState = (response.headers.get(CACHE_STATE) ?? "").trim();
   const cacheState = traceCacheState(rawCacheState);
-  // 只有本次真的回源（miss / miss-user / bypass / static-miss）才透传源站的 d1/ssr/app；
+  // 只有本次真的回源（miss / miss-user / bypass / static-miss / static-bypass）才透传源站的 d1/ssr/app；
   // 缓存回放（hit / stale* / static-hit）里那份是「当初那次」的数，透传会把旧数冒充本次。
-  // static-miss 不在 traceCacheState 的白名单里（它在源头不参与上报），所以这里单列一条。
+  // static-miss / static-bypass 不在 traceCacheState 的白名单里（静态档不上报），所以这里单列。
   const originFresh =
-    cacheState === "miss" || cacheState === "miss-user" || cacheState === "bypass" || rawCacheState === "static-miss";
+    cacheState === "miss" ||
+    cacheState === "miss-user" ||
+    cacheState === "bypass" ||
+    rawCacheState === "static-miss" ||
+    rawCacheState === "static-bypass";
   try {
     const sample = Math.random() < TRACE_SAMPLE_RATE;
     // 缓存慢本身也算「慢请求」：竞速后回源会抢跑，这类请求的 total/up 都很漂亮，
