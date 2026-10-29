@@ -272,6 +272,38 @@ const TRACE_TOTAL_SLOW_MS = 2_000;
 const TRACE_SAMPLE_RATE = 0.02;
 
 /**
+ * 设计上就慢、但**不是问题**的端点：不参与 trace 上报（2026-10-29）。
+ *
+ * `/api/device-wait` 是长轮询（挂 15 秒等推送），每次都会越过所有慢阈值。
+ * 结果：Netlify 日志和 ip_logs 里堆满 `up=15002ms` 的假"慢请求"，
+ * 真正的卡顿（比如缓存卡 11 秒）反而被淹掉。
+ */
+const LONG_POLL_PATHS: ReadonlySet<string> = new Set(["/api/device-wait"]);
+
+/**
+ * 本边缘函数当前跑在哪个区域（2026-10-29）。
+ *
+ * 站主的疑问是"同一用户为什么一会儿快一会儿慢"，而日志里的 `colo` 是 **CF 的机房**，
+ * 不是 Netlify 把函数调度到了哪里。Netlify Edge 基于 Deno Deploy 系运行时，
+ * 因此先取 `DENO_REGION`；再兜底几个常见环境变量。全都取不到就返回 "?"，
+ * 那样日志里至少能看出"这个字段拿不到"，而不是猜一个值。
+ */
+function edgeRegion(): string {
+  try {
+    const env = (globalThis as { Deno?: { env?: { get(k: string): string | undefined } } }).Deno?.env;
+    const v =
+      env?.get("DENO_REGION") ??
+      env?.get("DENO_DEPLOYMENT_ID_REGION") ??
+      env?.get("AWS_REGION") ??
+      (globalThis as { Netlify?: { context?: { server?: { region?: string } } } }).Netlify?.context
+        ?.server?.region;
+    return typeof v === "string" && v.length > 0 ? v : "?";
+  } catch {
+    return "?";
+  }
+}
+
+/**
  * path 归一化（**必须与源站 `app/routes/api.trace.tsx` 的 normalizeTracePath 逐字一致**）：
  * 代理先做一次，源站再兜一次，防漏。规则：
  *   ① 只保留 pathname（`?query` / `#hash` 丢掉）；② 去空白与控制字符；
@@ -358,10 +390,17 @@ function reportTrace(
       // 2026-10-29：三路竞速的赢家（cache / origin1 / origin2）；非 GET 没竞速，记 none。
       race,
       colo: trace.colo ?? "?",
+      // 2026-10-29：**本函数自己跑在哪个区域**（不是 CF 的 colo）。
+      // 站主反馈"一会儿快一会儿慢"的根因就是这个：Netlify 每次请求可能把函数调度到
+      // 新加坡（出口 3.1.x → CF SIN，查库本地）或美东（出口 54.x → CF EWR，跨太平洋）。
+      // Deno Deploy 系运行时通过 DENO_REGION 暴露所在区域；取不到就记 "?"。
+      region: edgeRegion(),
     });
     // 一行结构化日志：Netlify 函数日志里 grep `[trace]` 就能直接看出慢在哪一段。
+    // region = 本函数跑在哪个区域（Netlify 调度结果）；colo = CF 服务源站的那个机房。
+    // 两者通常同区（SIN↔ap-southeast、EWR/IAD↔us-east-1），但 region 才是"抽签"的直接证据。
     console.log(
-      `[trace] cache=${cache} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms colo=${trace.colo ?? "?"} path=${path}`,
+      `[trace] region=${edgeRegion()} cache=${cache} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms colo=${trace.colo ?? "?"} path=${path}`,
     );
     // 先把请求发出去，再尝试挂到 waitUntil 上：补报（响应已经交出后才上报）时
     // waitUntil 窗口可能已经关了，此时请求至少已经发出，不会被这段 try 吞掉。
@@ -2049,6 +2088,11 @@ export default async function handler(request: Request, ctx: Context): Promise<R
     const report = (cacheMs: number): void => {
       // 静态档一律不报（第 42 条）：/img/* 一次首屏就十几二十条，命中/未命中都写会把 ip_logs 刷爆。
       if (trace.static === true) return;
+      // 2026-10-29：**长轮询不算慢**。
+      // `/api/device-wait` 是设计上挂 15 秒的长轮询（等推送），它每次都会越过所有阈值，
+      // 于是把 Netlify 日志和 ip_logs 刷满 `up=15002ms` 的假"慢请求"，真正的问题被挤掉。
+      // 这些端点单独排除，不参与上报。
+      if (LONG_POLL_PATHS.has(url.pathname)) return;
       const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS || cacheMs > TRACE_UP_SLOW_MS;
       if (slow || sample) {
         reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs, cacheMs, raceName);
