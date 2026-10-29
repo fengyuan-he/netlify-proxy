@@ -52,6 +52,22 @@
 //     同时 cacheMs 把「进函数 → 缓存查询结束」单独报出来，回溯 11s 到底卡在缓存还是建连。
 // 37. 非 GET 一律不竞速：写操作翻倍且无法取消，只能原样单路。
 // 38. 缓存命中时也照样白跑两路回源（发起后立刻 abort）：这是站主明确接受的代价，换来的是「缓存慢也不慢」。
+//
+// ── 第四档：静态资源缓存（2026-10-29）───────────────────────────────────────
+// 39. 静态档是**独立一档**：独立 cache 名、独立键空间、独立时间窗。anon/user 的判据（Accept / cookie /
+//     gzip / epoch）与它无关，混进去只会让那两档的键多出维度、TTL 互相迁就。
+//     唯一入口是 handler 里的 isStaticRequest：GET + 静态前缀 + 无 Range；不匹配就完全走原来的三档。
+// 40. 判据只看 pathname（/img/ /assets/ /frames/ /splash-*.png），query 只进缓存键：
+//     同一张图带 `?r=3`（客户端破自己缓存）仍是同一份资源，让 query 参与判据会把它踢出静态档。
+// 41. 静态档的回源只有**一路**（不 clone 请求、不 startOriginRace），但缓存探测与这一路是**并行**的：
+//     缓存先赢就 abort 它，回源先赢就用它、忽略缓存那一路。理由：图片多跑一次只是一次 R2 读、零 D1，
+//     这点代价换来「Cache API 卡住（实测过 11s）也不拖住图片」；而两路回源就没有必要了。
+// 42. 静态档不报 trace（命中/未命中都不报）：/img/* 一次首屏就十几二十条，写进 ip_logs 会把日志表刷爆。
+// 43. 写入门槛比 HTML 严：200 + content-type 白名单 + 无 Set-Cookie；401/403/404、HTML 错误页、
+//     application/octet-stream 一律交给原来的 bypass 收尾 —— 宁可多回源一次，也不把一次失败固化 30 天。
+// 44. 硬过期（age > SWR 30 天）先删条目再回源：这才是真的「重取」，否则条目永远占着 match 的位置。
+// 45. 带 content-encoding 的条目只在客户端声明接受该编码时回放：键里没有 accept-encoding，
+//     否则不认 br/gzip 的客户端会拿到解不开的字节（回源一次总比给错字节好）。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -72,7 +88,10 @@ const TARGET_BASE: string = TARGET_URL
   : "";
 
 const CACHE_VERSION = "v4";
-const CACHE_NAME = `zhuge-anon-${CACHE_VERSION}-${Deno.env.get("BUILD_ID") ?? "static"}`;
+// BUILD_ID 只在这里读一次（Deno.env 在本文件的类型检查里没有声明，多处引用只会多几条同类错误）。
+// 行为与原来逐字等价：两档 cache 名的后缀仍是同一个 BUILD_ID，取不到仍是 "static"。
+const BUILD_ID: string = Deno.env.get("BUILD_ID") ?? "static";
+const CACHE_NAME = `zhuge-anon-${CACHE_VERSION}-${BUILD_ID}`;
 
 // 匿名档窗口（2026-10-29 放大：批量探测 305 节点并发要能落在同一个热条目上）
 // 注意：这组常量是**匿名档专属**，成员档用下面独立的 USER_* 一组，改这里不影响成员档。
@@ -87,6 +106,18 @@ const USER_SWR_MS = 300_000; // 300s
 const USER_HARD_STALE_MS = 600_000; // 600s
 const USER_STORE_TTL_S = 720; // 必须 > USER_HARD_STALE_MS
 const EPOCH_TTL_S = 7 * 24 * 3_600; // epoch 条目必须活得比任何页面条目都久
+
+// ── 第四档（静态资源）窗口：与上面两组完全独立，改这里不影响 anon / user 任何一档 ──
+const STATIC_CACHE_VERSION = "v1";
+// 独立 cache 名：静态档的条目与 anon/user 的 HTML 条目物理隔离，键空间也互不可见。
+const STATIC_CACHE_NAME = `zhuge-static-${STATIC_CACHE_VERSION}-${BUILD_ID}`;
+const STATIC_FRESH_MS = 7 * 24 * 3_600_000; // 7 天：纯新鲜窗口（分档见 staticAgeOf）
+const STATIC_SWR_MS = 30 * 24 * 3_600_000; // 30 天：SWR 窗口上界，同时就是硬过期点
+const STATIC_STORE_TTL_S = 30 * 24 * 3_600; // 30 天：= SWR；硬过期后由下一次请求删掉重取
+// 键的内部固定 origin：不含 cookie / theme / epoch，也不与 cache.invalid 的两种 HTML 键重叠。
+const STATIC_KEY_ORIGIN = "https://static-cache.internal";
+// 条目里没记到源站原值时的兜底（源站对这些资源实际发的是 immutable 1 年）。
+const STATIC_DEFAULT_CC = "public, max-age=31536000, immutable";
 
 const ORIGIN_TIMEOUT_MS = 15_000; // 只卡响应头
 const MAX_QUERY_PARAMS = 6; // 防随机参数把缓存打爆
@@ -197,10 +228,19 @@ type Trace = {
   tUp?: number;
   /** 回源响应头 cf-ray 的后缀（`a51a…-HKG` → `HKG`），拿不到就是 `?`。 */
   colo?: string;
-  /** 三路竞速的赢家；没竞速（非 GET）时是 `none`。 */
-  race?: "cache" | "origin1" | "origin2" | "none";
+  /**
+   * 竞速的赢家；没有竞速（非 GET）时是 `none`。
+   * 静态档只有一路回源，赢家记 `static`（缓存赢仍记 `cache`），不占用 origin1 / origin2 的语义。
+   * 注意：静态档恒不上报（trace.static），这个值只在本进程内用于分段计时与日志判读。
+   */
+  race?: "cache" | "origin1" | "origin2" | "static" | "none";
   /** 缓存查询最终完成（即使响应已经返回）：回源先赢时用它补报真实的 cacheMs。 */
   cacheSettled?: Promise<void>;
+  /**
+   * 静态资源档（第四档）：命中/未命中都**不上报** trace（第 42 条）。
+   * 只是个标记位，trace 里其它字段照旧填（Server-Timing 还在用它们），不参与任何响应决策。
+   */
+  static?: true;
 };
 
 /** 慢请求判定阈值：上游 > 800ms 或 总时长 > 2000ms 必报；其余按 2% 随机采样对照。 */
@@ -378,6 +418,25 @@ function acceptsGzip(header: string): boolean {
   return false;
 }
 
+/** 与 acceptsGzip 同一套判据（精确 token 或 `*`，`q=0` 视为拒绝），但可以问任意编码。 */
+function acceptsCoding(header: string, coding: string): boolean {
+  const wanted = coding.trim().toLowerCase();
+  if (wanted.length === 0) return true;
+  if (header.trim().length === 0) return false;
+  for (const part of header.split(",")) {
+    const segments = part.split(";");
+    const token = (segments[0] ?? "").trim().toLowerCase();
+    if (token !== wanted && token !== "*") continue;
+    let rejected = false;
+    for (let i = 1; i < segments.length; i += 1) {
+      const pair = (segments[i] ?? "").split("=");
+      if ((pair[0] ?? "").trim().toLowerCase() === "q" && Number(pair[1]) === 0) rejected = true;
+    }
+    if (!rejected) return true;
+  }
+  return false;
+}
+
 function isOldEngine(userAgent: string): boolean {
   if (/\b(?:Trident|MSIE)\b/.test(userAgent)) return true;
   const match = /\b(?:Chrome|Chromium|CriOS)\/(\d+)/.exec(userAgent);
@@ -445,6 +504,110 @@ function isCacheableTarget(url: URL): boolean {
   if (canonicalCount > MAX_QUERY_PARAMS) return false;
 
   return true;
+}
+
+/* ── 静态资源档：识别 / 缓存键 / content-type 白名单 ─────────────────────── */
+
+/**
+ * 静态档路径判定：**只看 pathname**（第 40 条）。
+ *   · /img/      站内图片（R2，key 内容寻址）
+ *   · /assets/   React Router 构建产物（带哈希，IMMUTABLE_ASSET 那一套）
+ *   · /frames/   头像框 SVG
+ *   · /splash-*  根目录 iOS 启动图（只认 .png）
+ */
+function isStaticPath(pathname: string): boolean {
+  if (pathname.startsWith("/img/")) return true;
+  if (pathname.startsWith("/assets/")) return true;
+  if (pathname.startsWith("/frames/")) return true;
+  return pathname.startsWith("/splash-") && pathname.toLowerCase().endsWith(".png");
+}
+
+/**
+ * 静态档的请求资格：GET + 静态前缀 + **不带 Range**。
+ * Range 一律不缓存：视频/断点续传要的是 206 + Content-Range，缓存里存的是整包，回放会毁掉播放器。
+ * 非 GET（HEAD / POST …）同样不接管 —— 原样落回三档分流（HEAD 因为 method !== GET 进 bypass）。
+ */
+function isStaticRequest(request: Request, url: URL): boolean {
+  if (request.method !== "GET") return false;
+  if (request.headers.has("range")) return false;
+  return isStaticPath(url.pathname);
+}
+
+/** 排序后的**完整** query：一个参数都不丢（`?v=5` 与 `?v=6` 必须是两个条目）。 */
+function sortedQueryString(url: URL): string {
+  const pairs: Array<[string, string]> = [];
+  url.searchParams.forEach((value, name) => pairs.push([name, value]));
+  pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); // sort 稳定，重复键保持原顺序
+  return new URLSearchParams(pairs).toString();
+}
+
+/**
+ * 静态档缓存键：https://static-cache.internal + pathname + (`?` + 排序后的 query)
+ * 不含 cookie、不含 theme / epoch / uid：这份字节对所有人生效（第 2 条）。
+ */
+function buildStaticCacheKey(url: URL): Request {
+  const qs = sortedQueryString(url);
+  const id = `${STATIC_KEY_ORIGIN}${url.pathname}${qs.length > 0 ? `?${qs}` : ""}`;
+  return new Request(id, { method: "GET" });
+}
+
+// content-type 白名单（比较时取分号前的主体、小写）：
+// 图片 / SVG（image/*）、字体（font/*）、以及下面这些 JS / CSS / 老字体类型。
+// **不包含** application/octet-stream、text/html、application/json：类型说不清就不缓存。
+const STATIC_CT_PREFIXES: readonly string[] = ["image/", "font/"];
+const STATIC_CT_EXACT: readonly string[] = [
+  "application/font-woff",
+  "application/x-font-woff",
+  "application/font-sfnt",
+  "application/vnd.ms-fontobject",
+  "application/svg+xml",
+  "text/css",
+  "text/javascript",
+  "text/ecmascript",
+  "application/javascript",
+  "application/x-javascript",
+  "application/ecmascript",
+];
+
+function isStaticContentType(headers: Headers): boolean {
+  const base = ((headers.get("content-type") ?? "").split(";")[0] ?? "").trim().toLowerCase();
+  if (base.length === 0) return false;
+  for (const prefix of STATIC_CT_PREFIXES) {
+    if (base.startsWith(prefix)) return true;
+  }
+  return STATIC_CT_EXACT.includes(base);
+}
+
+/**
+ * 条目能不能回放给这个客户端（第 45 条）：条目带 content-encoding 时，
+ * 只有客户端声明接受该编码才回放；判不了就当作不能回放。
+ */
+function staticEntryReplayable(hit: Response, request: Request): boolean {
+  const encoding = (hit.headers.get("content-encoding") ?? "").trim().toLowerCase();
+  if (encoding.length === 0 || encoding === "identity") return true;
+  if (
+    encoding !== "gzip" &&
+    encoding !== "br" &&
+    encoding !== "deflate" &&
+    encoding !== "zstd"
+  ) {
+    return false;
+  }
+  return acceptsCoding(request.headers.get("accept-encoding") ?? "", encoding);
+}
+
+/**
+ * 条目的年龄档（三个常量都在这里落地）：
+ *   fresh   < FRESH(7 天)      → 纯命中
+ *   swr     FRESH~SWR(30 天)   → SWR 段，仍然回放（资源 immutable，不值得为它回源）
+ *   expired ≥ SWR              → 硬过期，删条目重取
+ */
+type StaticAge = "fresh" | "swr" | "expired";
+
+function staticAgeOf(ageMs: number): StaticAge {
+  if (ageMs < STATIC_FRESH_MS) return "fresh";
+  if (ageMs < STATIC_SWR_MS) return "swr";
+  return "expired";
 }
 
 /**
@@ -1440,6 +1603,264 @@ async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Re
   return finishing.kind === "response" ? finishing.response : text(502, "Bad Gateway");
 }
 
+/* ── 档位四：静态资源（缓存 vs **单路**回源并行，不写 trace）──────────────── */
+
+/** 静态档的写入计划：只有 cache 与 key —— 没有 theme / epoch / uid 维度。 */
+type StaticStorePlan = { cache: Cache; key: Request };
+
+/**
+ * 静态档的回源收尾。
+ * 写入条件（第 4 条）：status 200 + content-type 白名单 + **没有任何 Set-Cookie**。
+ * 形状不合格的那一份（401/403/404、HTML 错误页、octet-stream、带 Set-Cookie）**原样交给
+ * processOrigin(plan=null)** —— 也就是改动前 bypass 档走的那段代码，状态码、响应头、
+ * Set-Cookie 去 Domain、Location / CORS 改写全部逐字一致（第 43 条）。
+ */
+function processStaticOrigin(
+  res: Response,
+  requestUrl: URL,
+  proxyOrigin: string,
+  plan: StaticStorePlan | null,
+): OriginOutput {
+  const cacheableShape =
+    res.status === 200 &&
+    res.body !== null &&
+    getSetCookies(res.headers).length === 0 &&
+    isStaticContentType(res.headers);
+
+  if (!cacheableShape || res.body === null) {
+    return processOrigin(res, requestUrl, proxyOrigin, null, "GET");
+  }
+
+  // 形状合格但这次没有写入计划（缓存那一路还没跑完 / Cache API 不可用）：
+  // 照实标 static-miss（这一次确实没从缓存拿到），只是不写。
+  if (plan === null) {
+    const out = buildResponseHeaders(res, requestUrl, "GET");
+    rewriteLocation(out, proxyOrigin);
+    rewriteCors(out, proxyOrigin);
+    out.set(CACHE_STATE, "static-miss");
+    return { response: withBody(res, out) };
+  }
+
+  const out = buildResponseHeaders(res, requestUrl, "GET");
+  rewriteLocation(out, proxyOrigin);
+  rewriteCors(out, proxyOrigin);
+
+  const [toClient, toCache] = res.body.tee();
+  out.delete("content-length"); // 同 HTML 档：body 过了 tee，旧长度不该再约束这条流
+  out.set(CACHE_STATE, "static-miss");
+
+  // 条目里另存源站原始 cache-control（浏览器下次别再经过本函数），TTL 只用来定平台淘汰时间。
+  const storeHeaders = new Headers(out);
+  storeHeaders.set(ORIGIN_CC, out.get("cache-control") ?? "");
+  storeHeaders.set("cache-control", `public, max-age=${STATIC_STORE_TTL_S}`);
+  storeHeaders.set(BORN, String(Date.now()));
+  storeHeaders.delete(CACHE_STATE);
+  storeHeaders.delete(CACHE_AGE);
+
+  let stored: Promise<void> | undefined;
+  try {
+    stored = plan.cache
+      .put(plan.key, new Response(toCache, { status: 200, statusText: res.statusText, headers: storeHeaders }))
+      .catch(() => {
+        // put 失败后没人读 toCache：必须主动取消，否则客户端分支会被反压拖住。
+        void toCache.cancel().catch(() => {});
+      });
+  } catch {
+    void toCache.cancel().catch(() => {});
+  }
+
+  return {
+    response: new Response(toClient, { status: 200, statusText: res.statusText, headers: out }),
+    stored,
+  };
+}
+
+/**
+ * 静态档回放：cache-control 用存储时记下的**源站原值**（immutable 1 年），
+ * 这样浏览器/CDN 下次根本不再经过这个函数 —— 与 HTML 两档「回放 private, no-cache」正好相反。
+ */
+function fromStaticCache(hit: Response, ageMs: number): Response {
+  const headers = new Headers(hit.headers);
+  const originCacheControl = headers.get(ORIGIN_CC);
+  headers.delete(ORIGIN_CC);
+  headers.delete(BORN);
+  headers.set(
+    "cache-control",
+    originCacheControl !== null && originCacheControl.length > 0 ? originCacheControl : STATIC_DEFAULT_CC,
+  );
+  headers.set(CACHE_STATE, "static-hit");
+  headers.set(CACHE_AGE, String(Math.max(0, Math.round(ageMs / 1000))));
+  return withBody(hit, headers);
+}
+
+/** 静态档的缓存探测结果：hit 一定是「这个客户端能回放」的那一种；plan 用来回源后写回。 */
+type StaticProbe = { hit?: { res: Response; ageMs: number }; plan: StaticStorePlan | null };
+
+/**
+ * 静态档缓存探测（与那唯一一路回源**并行**跑，见 serveStatic）：
+ * 打不开 / match 抛错一律降级为「没有缓存」，本次不回写、直接单路回源，绝不 5xx。
+ * 命中但条目编码这个客户端不认 → 不回放、也不删条目（对别的客户端它仍然有效），本次按本次编码重写。
+ */
+async function probeStatic(request: Request, url: URL, ctx: Context, trace: Trace): Promise<StaticProbe> {
+  try {
+    const openedCache = await caches.open(STATIC_CACHE_NAME);
+    const cacheKey = buildStaticCacheKey(url);
+
+    const matched = await openedCache.match(cacheKey);
+    trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
+    if (matched) {
+      if (trace.colo === undefined) trace.colo = traceColo(matched);
+      const ageMs = entryAge(matched);
+      const age = staticAgeOf(ageMs);
+
+      if (age === "expired") {
+        // 硬过期（≥ SWR 30 天）：取消 body 后删条目，回源重取（第 44 条）。
+        // 这里**不 await** discard：body 的 cancel 在某些运行时（tee 出来的流）要等另一分支一起取消，
+        // 探测路径绝不能因为「放掉一条流」而慢下来 —— 那正是要躲开的 cacheMs 卡顿。
+        void discard(matched);
+        waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
+      } else if (staticEntryReplayable(matched, request)) {
+        // fresh（< 7 天）与 swr（7~30 天）两档都直接回放、都标 static-hit：
+        // 静态资源是 immutable 的，swr 段的旧副本与源站逐字节相同，所以这一档**不发起后台刷新**
+        // （与 HTML 两档的 refresh 不同）；条目的「新旧」对外只看 x-proxy-age。
+        return { hit: { res: matched, ageMs }, plan: { cache: openedCache, key: cacheKey } };
+      } else {
+        // 条目是 gzip/br 而客户端没声明接受：这次不回放（第 45 条），回源后按本次编码重写。
+        // 同样不 await：取消只是一条流的清理，不该出现在关键路径上。
+        void discard(matched);
+      }
+    }
+    return { plan: { cache: openedCache, key: cacheKey } };
+  } catch {
+    // 缓存打不开 / match 抛错：本次不回写
+  }
+  if (trace.tCache === undefined) trace.tCache = Date.now(); // 缓存提前失败：查询也结束了
+  return { plan: null };
+}
+
+/**
+ * 静态档的写缓存收尾：processStaticOrigin 出响应，stored 挂到 waitUntil 上。
+ */
+function finishStaticOrigin(
+  res: Response,
+  url: URL,
+  proxyOrigin: string,
+  plan: StaticStorePlan | null,
+  ctx: Context,
+): Response {
+  const { response, stored } = processStaticOrigin(res, url, proxyOrigin, plan);
+  if (stored !== undefined) waitUntil(ctx, stored);
+  return response;
+}
+
+/**
+ * 静态档主流程：**缓存探测与「唯一一路」回源并行**，谁先成功用谁。
+ *
+ *   cacheP  ──┐
+ *   origin  ──┴─ 先到先用：缓存先赢 → abort 那一路回源；回源先赢 → 缓存那一路忽略（它没法 abort）
+ *
+ * 与 HTML 档的差别只有一条：回源是**单路**（第 41 条），不是两路。白跑一次图片回源 = 一次 R2 读、
+ * 零 D1，所以这条路径也享受「缓存卡住不拖住用户」，但不会把回源量乘二。
+ *
+ *   · age < FRESH(7d)         → 回放，x-proxy-cache: static-hit
+ *   · FRESH ≤ age < SWR(30d)  → 同样回放（内容 immutable，不值得为它再回源一次），仍标 static-hit
+ *   · age ≥ SWR / 编码不匹配  → 删条目，回源重取
+ *   · 未命中                  → 单路回源 → 写缓存，x-proxy-cache: static-miss
+ *
+ * 全程不报 trace（第 42 条），也不碰 epoch（静态资源与登录态无关）。
+ */
+async function serveStatic(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
+  trace.static = true; // 命中 / 未命中都不上报，见 handler 里的 report 守卫
+  const proxyOrigin = url.origin;
+
+  // ① 唯一一路回源立刻出发（不 clone 请求）；它与下面的缓存探测并行。
+  const controller = new AbortController();
+  let cacheWins = false; // 缓存先赢：这一路回源即使已经成功落地，body 也要放掉
+  trace.tFetch = Date.now();
+  const originP: Promise<Response> = fetchOrigin(request, url, {
+    forceGzip: false,
+    canonicalReferer: false,
+    signal: controller.signal,
+  }).then((res) => {
+    if (cacheWins) {
+      void discard(res); // 缓存已经回放了，这条没人要
+      return res;
+    }
+    trace.tUp = Date.now();
+    trace.colo = traceColo(res);
+    trace.race = "static"; // 回源赢家记 "static"，不占用 origin1 / origin2 的语义
+    return res;
+  });
+
+  // ② 缓存探测与它同时开跑；probe 兜成永不 reject（任何意外都退化成「这一档没缓存」）。
+  const probeP: Promise<StaticProbe> = probeStatic(request, url, ctx, trace).catch(
+    (): StaticProbe => ({ plan: null }),
+  );
+  trace.cacheSettled = probeP.then(
+    () => undefined,
+    () => undefined,
+  );
+
+  const first = await Promise.race([
+    probeP.then((probe) => ({ kind: "probe" as const, probe })),
+    originP.then(
+      (res) => ({ kind: "origin" as const, res }),
+      () => ({ kind: "failed" as const }),
+    ),
+  ]);
+
+  // 结果一：缓存先赢 → abort 那唯一一路回源，直接回放。
+  if (first.kind === "probe" && first.probe.hit !== undefined) {
+    cacheWins = true;
+    controller.abort();
+    // 回源那一路可能刚好也成功了（只是比缓存慢一拍）：把它的 body 放掉，别留一条没人读的流。
+    void originP.then(
+      (res) => {
+        void discard(res);
+      },
+      () => undefined,
+    );
+    trace.race = "cache";
+    trace.tFetch = undefined; // 没有用上回源：up 记 0，proxy 退回整段函数耗时（与 HTML 档同口径）
+    trace.tUp = undefined;
+    return fromStaticCache(first.probe.hit.res, first.probe.hit.ageMs);
+  }
+
+  // 结果二：回源抛了 → 缓存那一路可能正好命中（它只是慢），先等它跑完再决定。
+  if (first.kind === "failed") {
+    const probe = await probeP;
+    if (probe.hit !== undefined) {
+      trace.race = "cache";
+      trace.tFetch = undefined;
+      trace.tUp = undefined;
+      return fromStaticCache(probe.hit.res, probe.hit.ageMs);
+    }
+    return text(502, "Bad Gateway");
+  }
+
+  // 结果三：probe 赢了但没有可回放的命中（miss / 编码不匹配 / 缓存故障）→ 等那唯一一路回源，
+  // 用它 + 探测给出的 plan 写缓存。
+  if (first.kind === "probe") {
+    try {
+      const res = await originP;
+      return finishStaticOrigin(res, url, proxyOrigin, first.probe.plan, ctx);
+    } catch {
+      trace.tFetch = undefined;
+      trace.tUp = undefined;
+      return text(502, "Bad Gateway");
+    }
+  }
+
+  // 结果四：回源先赢（正常 miss 就是这条）→ 用它；缓存那一路还在跑的话，跑完把 body 放掉。
+  void probeP.then(
+    (probe) => {
+      if (probe.hit !== undefined) void discard(probe.hit.res);
+    },
+    () => undefined,
+  );
+  return finishStaticOrigin(first.res, url, proxyOrigin, null, ctx);
+}
+
 /* ── 入口 ───────────────────────────────────────────────────────────────── */
 
 export default async function handler(request: Request, ctx: Context): Promise<Response> {
@@ -1452,17 +1873,23 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   const trace: Trace = { t0 };
   let response: Response;
 
-  // 三档分流只在 classifyTier 一处判定，handler 只负责转派。
-  switch (classifyTier(request, url)) {
-    case "anon":
-      response = await serveAnonymous(request, url, ctx, trace);
-      break;
-    case "user":
-      response = await serveMember(request, url, ctx, trace);
-      break;
-    default:
-      // 直连档没有缓存查询：tCache = t0（在 serveDirect 里补）
-      response = await serveDirect(request, url, trace);
+  // 第四档（静态资源）在分流之前单独判一次：GET + 静态前缀 + 无 Range 才接管。
+  // 不匹配的请求一个字节都不多走 —— 下面的 classifyTier 与三档代码完全没改过。
+  if (isStaticRequest(request, url)) {
+    response = await serveStatic(request, url, ctx, trace);
+  } else {
+    // 三档分流只在 classifyTier 一处判定，handler 只负责转派。
+    switch (classifyTier(request, url)) {
+      case "anon":
+        response = await serveAnonymous(request, url, ctx, trace);
+        break;
+      case "user":
+        response = await serveMember(request, url, ctx, trace);
+        break;
+      default:
+        // 直连档没有缓存查询：tCache = t0（在 serveDirect 里补）
+        response = await serveDirect(request, url, trace);
+    }
   }
 
   // ── 链路追踪上报 + 分段计时（tEnd 在这里：返回响应前）────────────────────
@@ -1480,15 +1907,20 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   // 直连档没有缓存查询：tCache 在 serveDirect 里取了 t0，恒为 0。
   const cacheMsNow = trace.tCache === undefined ? undefined : Math.max(0, trace.tCache - t0);
   const raceName = trace.race ?? "none";
-  const cacheState = traceCacheState(response.headers.get(CACHE_STATE));
-  // 只有本次真的回源（miss / miss-user / bypass）才透传源站的 d1/ssr/app；
-  // 缓存回放（hit / stale*）里那份是「当初那次」的数，透传会把旧数冒充本次。
-  const originFresh = cacheState === "miss" || cacheState === "miss-user" || cacheState === "bypass";
+  const rawCacheState = (response.headers.get(CACHE_STATE) ?? "").trim();
+  const cacheState = traceCacheState(rawCacheState);
+  // 只有本次真的回源（miss / miss-user / bypass / static-miss）才透传源站的 d1/ssr/app；
+  // 缓存回放（hit / stale* / static-hit）里那份是「当初那次」的数，透传会把旧数冒充本次。
+  // static-miss 不在 traceCacheState 的白名单里（它在源头不参与上报），所以这里单列一条。
+  const originFresh =
+    cacheState === "miss" || cacheState === "miss-user" || cacheState === "bypass" || rawCacheState === "static-miss";
   try {
     const sample = Math.random() < TRACE_SAMPLE_RATE;
     // 缓存慢本身也算「慢请求」：竞速后回源会抢跑，这类请求的 total/up 都很漂亮，
     // 只有 cacheMs 能把「缓存卡了 11s」暴露出来，否则它们只会落在 2% 采样里。
     const report = (cacheMs: number): void => {
+      // 静态档一律不报（第 42 条）：/img/* 一次首屏就十几二十条，命中/未命中都写会把 ip_logs 刷爆。
+      if (trace.static === true) return;
       const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS || cacheMs > TRACE_UP_SLOW_MS;
       if (slow || sample) {
         reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs, cacheMs, raceName);
