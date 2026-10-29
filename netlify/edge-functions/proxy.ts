@@ -1931,15 +1931,20 @@ async function processOrigin(
         storeHeaders.delete(CACHE_AGE);
         storeHeaders.delete(USER_STATE);
         storeHeaders.delete(EPOCH_STATE);
+        storeHeaders.delete("set-cookie"); // 第 58 条：内部 bookmark cookie 不进缓存条目
 
         await latePlan.cache.put(
           latePlan.key,
           new Response(bodyBytes, { status: 200, statusText: res.statusText, headers: storeHeaders }),
         );
+        // 证据行（第 58 条）：写成功/失败各留一行，Netlify 日志里能直接看到。
+        // 之前「永远 miss-user」之所以查了很久，就是因为 put 失败被静默吞掉。
+        console.log(`[store] deferred-ok ${latePlan.key.url} ${bodyBytes.byteLength}B`);
         // 与既有写入成功一致：让匿名档负缓存失效，否则刚写进去的条目 3 秒内没人看得见（第 50 条）。
         if (!latePlan.requireUserMark) mirrorForgetMiss(requestUrl);
-      })().catch(() => {
-        // 延迟写失败静默：这次没缓存而已，客户端响应早已交出去了。
+      })().catch((err: unknown) => {
+        // 延迟写失败静默（客户端响应早已交出去），但**必须留证据**，否则又是一次无声失败。
+        console.log(`[store] deferred-fail ${String(err).slice(0, 160)}`);
       }),
     );
 
@@ -1973,6 +1978,19 @@ async function processOrigin(
   storeHeaders.delete(CACHE_AGE);
   storeHeaders.delete(USER_STATE);
   storeHeaders.delete(EPOCH_STATE);
+  /**
+   * 2026-10-29（第 58 条）：**存进缓存的那一份必须去掉 `set-cookie`**。
+   *
+   * 站主实测：登录态 `/characters.data` 的键稳定（`x-proxy-key: /characters.data`）、
+   * epoch 也没变（`x-proxy-epoch: 0`），但永远 `miss-user` —— 说明**根本没写进去**。
+   *
+   * 那一发响应带着 `set-cookie: zhuge_d1bm=…`（D1 会话的 bookmark）。我们把 `out`
+   * 整份拷进 `storeHeaders` 去 `put`，而 Cache API 对带 `Set-Cookie` 的响应一向保守
+   * （各实现策略不一，被拒时 `put` 会 reject，被我们的 catch 吞掉 ⇒ 静默不写）。
+   *
+   * 结论：内部一致性 cookie **不该进缓存条目**（回放一份旧 bookmark 也没有意义）。
+   */
+  storeHeaders.delete("set-cookie");
 
   let stored: Promise<void> | undefined;
   try {
