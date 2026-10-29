@@ -133,6 +133,52 @@ const TARGET_BASE_ALT: string = TARGET_URL_ALT
 const TARGET_HOST_ALT: string = TARGET_URL_ALT ? TARGET_URL_ALT.host : "";
 const TARGET_ORIGIN_ALT: string = TARGET_URL_ALT ? TARGET_URL_ALT.origin : "";
 
+/**
+ * 竞速第三路的目标（2026-10-29）——同样只从环境变量读。
+ *
+ * 配置：`TARGET_URL_ALT2 = https://zhuge-v2.bishojoism.workers.dev`
+ *
+ * 为什么值得加第三路：实测把第二路换成 master 域后，胜率从 50/50 变成 **76/24**
+ * ——证明"不同 zone 的域名 → 不同 anycast 段 → 不同 BGP 路径"这条推断成立。
+ * 但 master 大部分时候更远，平均只捞到 −80ms。
+ * 既然换域名真的能换路，那再加一条**完全不同基础设施**的路（workers.dev 不走自定义域的
+ * anycast 段），就多一次"落近处"的机会。
+ *
+ * 不设置 ⇒ 第三路不存在，行为与只有两路时完全一致。
+ */
+const TARGET_URL_ALT2: URL | null = (() => {
+  try {
+    const raw = Deno.env.get("TARGET_URL_ALT2");
+    if (raw === undefined || raw.trim() === "") return null;
+    return new URL(raw.trim());
+  } catch {
+    return null;
+  }
+})();
+const TARGET_BASE_ALT2: string = TARGET_URL_ALT2
+  ? `${TARGET_URL_ALT2.origin}${TARGET_URL_ALT2.pathname.replace(/\/+$/, "")}`
+  : "";
+const TARGET_HOST_ALT2: string = TARGET_URL_ALT2 ? TARGET_URL_ALT2.host : "";
+const TARGET_ORIGIN_ALT2: string = TARGET_URL_ALT2 ? TARGET_URL_ALT2.origin : "";
+
+/**
+ * 竞速目标列表：第 0 项永远是主目标；备用目标按配置依次加入。
+ * 竞速的腿数 = 这个数组的长度（1~3），所以"不配环境变量"就等于"只有一条腿"，
+ * 不会出现"打到一个不存在的目标"的情况。
+ */
+type OriginTarget = { base: string; origin: string; host: string };
+const ORIGIN_TARGETS: readonly OriginTarget[] = [
+  { base: TARGET_BASE, origin: TARGET_ORIGIN, host: TARGET_HOST },
+  ...(TARGET_BASE_ALT.length > 0
+    ? [{ base: TARGET_BASE_ALT, origin: TARGET_ORIGIN_ALT, host: TARGET_HOST_ALT }]
+    : []),
+  ...(TARGET_BASE_ALT2.length > 0
+    ? [{ base: TARGET_BASE_ALT2, origin: TARGET_ORIGIN_ALT2, host: TARGET_HOST_ALT2 }]
+    : []),
+];
+/** 竞速的腿数（1~3）。第二路只在有备用目标时才存在。 */
+const RACE_LEGS = ORIGIN_TARGETS.length;
+
 const CACHE_VERSION = "v4";
 // BUILD_ID 只在这里读一次（Deno.env 在本文件的类型检查里没有声明，多处引用只会多几条同类错误）。
 // 行为与原来逐字等价：两档 cache 名的后缀仍是同一个 BUILD_ID，取不到仍是 "static"。
@@ -287,7 +333,7 @@ type Trace = {
    * 静态档只有一路回源，赢家记 `static`（缓存赢仍记 `cache`），不占用 origin1 / origin2 的语义。
    * 注意：静态档恒不上报（trace.static），这个值只在本进程内用于分段计时与日志判读。
    */
-  race?: "cache" | "origin1" | "origin2" | "static" | "none";
+  race?: "cache" | "origin1" | "origin2" | "origin3" | "static" | "none";
   /** 缓存查询最终完成（即使响应已经返回）：回源先赢时用它补报真实的 cacheMs。 */
   cacheSettled?: Promise<void>;
   /**
@@ -888,10 +934,10 @@ type OriginOptions = {
   /** 强制 accept-encoding: gzip（缓存档必须，保证桶里只有一种编码）。 */
   forceGzip: boolean;
   /**
-   * 换一个目标 base（2026-10-29）：竞速第二路打备用域名，让 BGP 可能选到别的机房。
-   * 不传 = 用 TARGET_BASE。
+   * 用 ORIGIN_TARGETS 里的第几项作为目标（2026-10-29）。
+   * 竞速让每一腿打不同的域名，好让 BGP 可能选到不同机房。不传 = 第 0 项（主目标）。
    */
-  baseOverride?: string;
+  targetIndex?: number;
   /**
    * 强制 accept-encoding: identity（静态档必须，见第 46 条）。
    * 静态条目的键里没有编码维度，只有 identity 字节才能回放给任何客户端。
@@ -932,13 +978,12 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
     headers.set("accept-encoding", "identity");
   }
 
-  // 换目标（竞速第二路）：base / origin / host 都跟着这一路走，
+  // 换目标（竞速每一腿打不同域名）：base / origin / host 都跟着这一腿走，
   // 否则源站看到的 Host 与实际目标不符，会按旧 Host 拼绝对地址或判错来源。
-  const altBase = options.baseOverride;
-  const useAlt = altBase !== undefined && altBase === TARGET_BASE_ALT && TARGET_BASE_ALT.length > 0;
-  const legOrigin = useAlt ? TARGET_ORIGIN_ALT : TARGET_ORIGIN;
-  const legHost = useAlt ? TARGET_HOST_ALT : TARGET_HOST;
-  const base = useAlt ? TARGET_BASE_ALT : TARGET_BASE;
+  const leg = ORIGIN_TARGETS[options.targetIndex ?? 0] ?? ORIGIN_TARGETS[0]!;
+  const legOrigin = leg.origin;
+  const legHost = leg.host;
+  const base = leg.base;
 
   const origin = request.headers.get("origin");
   if (origin !== null && origin === proxyOrigin) headers.set("origin", legOrigin);
@@ -986,7 +1031,7 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
 
 /* ── 三路竞速：缓存 + 两路回源（2026-10-29）─────────────────────────────── */
 
-type OriginWinner = { res: Response; label: "origin1" | "origin2"; ms: number };
+type OriginWinner = { res: Response; label: "origin1" | "origin2" | "origin3"; ms: number };
 
 type OriginRace = {
   /** 第一路成功返回的回源（含它自己的耗时）；两路都失败时 reject，错误原样交给调用方。 */
@@ -1003,19 +1048,21 @@ type OriginRace = {
  * 失败不在这里吞：两路都 reject 时 winner 也 reject，调用方照旧走 502 / stale 错误路径。
  */
 function startOriginRace(request: Request, url: URL, options: OriginOptions): OriginRace {
-  const labels = ["origin1", "origin2"] as const;
-  const controllers: AbortController[] = [new AbortController(), new AbortController()];
+  // 腿数 = 配置了几个目标（1~3）。1 个目标时退化成单路回源，不做竞速。
+  const labels = ["origin1", "origin2", "origin3"] as const;
+  const legCount = Math.max(1, RACE_LEGS);
+  const controllers: AbortController[] = Array.from({ length: legCount }, () => new AbortController());
   let decided = false;
   let abandoned = false;
   let settledWinner: OriginWinner | null = null;
 
   const legs: Array<Promise<OriginWinner>> = controllers.map((controller, index) => {
-    // 第二路用 clone：两路各消费自己的 body（GET 没有 body，这里照样 clone，
-    // 免得以后被复用到带 body 的方法上时两路互相锁死）。
+    // 除第一路外都用 clone：各腿消费自己的 body（GET 没有 body，这里照样 clone，
+    // 免得以后被复用到带 body 的方法上时几腿互相锁死）。
     const attempt = index === 0 ? request : request.clone();
     const startedAt = Date.now();
     /**
-     * 2026-10-29：**第二路改打备用域名**（TARGET_BASE_ALT）。
+     * 2026-10-29：**每一腿打不同的域名**（第 index 个目标）。
      *
      * 起因：站主发现"同一用户一会儿快一会儿慢"，实测同一个出口 IP 会被 CF 分到
      * SIN / EWR / IAD / **MRS（马赛）** 等不同机房——`region=aws-ap-southeast-1` 却
@@ -1029,13 +1076,12 @@ function startOriginRace(request: Request, url: URL, options: OriginOptions): Or
      * 正确性：og:url / 分享链接用的是常量 `SITE_ORIGIN`（apex），与请求 Host 无关；
      * 会话 cookie 只按名字读取，也与 Host 无关（反代还会剥掉 Set-Cookie 的 Domain）。
      */
-    const legOptions: OriginOptions = index === 1 && TARGET_BASE_ALT.length > 0
-      ? { ...options, signal: controller.signal, baseOverride: TARGET_BASE_ALT }
-      : { ...options, signal: controller.signal };
+    // 每一腿打 ORIGIN_TARGETS[index]（第 0 项是主目标，其余是备用域）。
+    const legOptions: OriginOptions = { ...options, signal: controller.signal, targetIndex: index };
     return fetchOrigin(attempt, url, legOptions).then((res) => {
       const value: OriginWinner = {
         res,
-        label: labels[index] as "origin1" | "origin2",
+        label: (labels[index] ?? "origin1") as "origin1" | "origin2" | "origin3",
         ms: Math.max(0, Date.now() - startedAt),
       };
       if (decided) {
