@@ -1003,6 +1003,24 @@ function isSingleFetchPath(pathname: string): boolean {
   return pathname.endsWith(".data") || pathname.endsWith(".rsc");
 }
 
+/**
+ * 这个路径是不是**纯遥测**端点（第 59 条）。
+ *
+ * 它们只写"观测数据"，不改变任何页面的内容，因此**不该推进 epoch**——
+ * 推进了就会把该用户所有成员缓存清空。而客户端每开一个页面就会发一次
+ * `/api/client-error`（RUM 打点），等于"看一页清一次缓存"，成员级缓存永远不生效。
+ *
+ * 注意：这里只影响 epoch，不影响这些端点本身的转发行为。
+ */
+function isTelemetryEndpoint(pathname: string): boolean {
+  return (
+    pathname === "/api/client-error" ||
+    pathname === "/api/trace" ||
+    pathname === "/api/ping" ||
+    pathname === "/api/netcheck"
+  );
+}
+
 function isCacheable(request: Request, url: URL): boolean {
   if (request.method !== "GET") return false;
 
@@ -2440,10 +2458,18 @@ async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Re
       return text(502, "Bad Gateway");
     }
 
-    // 任何非 GET 成功（status < 400）都推进该用户 epoch。
+    // 任何**会改变页面内容**的非 GET 成功才推进 epoch。
     // 这里 await 而不是 waitUntil：响应一返回，浏览器就会紧接着发下一个 GET，
     // 那一发必须已经能读到新 epoch，否则「回帖后仍看到旧页面」的原问题会重新出现。
-    if (originRes.status < 400) {
+    //
+    // 2026-10-29（第 59 条）：**遥测端点绝不能推进 epoch**。
+    // 站主实测「命中一两下就又不命中」，查到的直接原因是 `x-proxy-epoch` 从 0 涨到 2——
+    // 而根因是**每个整页加载都会发一条 RUM**（`/api/client-error`，2026-10-29 新加的客户端打点），
+    // 它是一次 POST ⇒ 一次 bumpEpoch ⇒ 该用户**所有**成员缓存键立刻换掉。
+    // 于是：打开页面 → 缓存清空 → 下次还是 miss。缓存等于从来没生效过。
+    //
+    // 判据：这些端点只写"观测数据"，不影响任何一个页面的内容，推进 epoch 是纯损失。
+    if (originRes.status < 400 && !isTelemetryEndpoint(url.pathname)) {
       await bumpEpochForRequest(request);
     }
 
