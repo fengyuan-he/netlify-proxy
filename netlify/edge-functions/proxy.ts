@@ -438,7 +438,15 @@ type Trace = {
    * 注意：静态档恒不上报（trace.static），这个值只在本进程内用于分段计时与日志判读。
    */
   race?: "cache" | "origin1" | "origin2" | "origin3" | "static" | "none";
-  /** 缓存查询最终完成（即使响应已经返回）：回源先赢时用它补报真实的 cacheMs。 */
+  /**
+   * 本次请求走的档位（2026-10-29）。**只进 trace 日志，绝不进响应头。**
+   *
+   * 为什么必须加：`cache` 字段分不出「匿名命中」和「登录命中」——两者都记 `hit`，
+   * 只有一个 `miss-user` 能在未命中时区分。于是「逐用户缓存到底有没有生效」
+   * 在日志里根本无法回答（站主问过，当时只能靠猜）。
+   * 加上之后可以直接分组：`tier=user cache=hit` = 登录档命中 = 逐用户缓存在工作。
+   */
+  tier?: "anon" | "user" | "static" | "bypass";  /** 缓存查询最终完成（即使响应已经返回）：回源先赢时用它补报真实的 cacheMs。 */
   cacheSettled?: Promise<void>;
   /**
    * 静态资源档（第四档）：命中/未命中都**不上报** trace（第 42 条）。
@@ -576,6 +584,10 @@ function reportTrace(
       // 新加坡（出口 3.1.x → CF SIN，查库本地）或美东（出口 54.x → CF EWR，跨太平洋）。
       // Deno Deploy 系运行时通过 DENO_REGION 暴露所在区域；取不到就记 "?"。
       region: edgeRegion(),
+      // 2026-10-29：档位（anon / user / static / bypass）。**没有它就没法回答
+      // 「逐用户缓存有没有生效」**——`cache` 字段里匿名命中和登录命中都记 hit。
+      // 源站 /api/trace 的白名单已经加了这个字段。
+      tier: trace.tier ?? "?",
     });
     // 一行结构化日志：Netlify 函数日志里 grep `[trace]` 就能直接看出慢在哪一段。
     // region = 本函数跑在哪个区域（Netlify 调度结果）；colo = CF 服务源站的那个机房。
@@ -587,7 +599,7 @@ function reportTrace(
     const openMs = trace.openMs ?? 0;
     const matchMs = trace.matchMs ?? 0;
     console.log(
-      `[trace] region=${edgeRegion()} cache=${cache} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms open=${openMs}ms match=${matchMs}ms colo=${trace.colo ?? "?"} path=${path} iso=${trace.iso} seq=${trace.seq}`,
+      `[trace] region=${edgeRegion()} cache=${cache} tier=${trace.tier ?? "?"} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms open=${openMs}ms match=${matchMs}ms colo=${trace.colo ?? "?"} path=${path} iso=${trace.iso} seq=${trace.seq}`,
     );
     // 先把请求发出去，再尝试挂到 waitUntil 上：补报（响应已经交出后才上报）时
     // waitUntil 窗口可能已经关了，此时请求至少已经发出，不会被这段 try 吞掉。
@@ -2544,10 +2556,13 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   // 第四档（静态资源）在分流之前单独判一次：GET + 静态前缀 + 无 Range 才接管。
   // 不匹配的请求一个字节都不多走 —— 下面的 classifyTier 与三档代码完全没改过。
   if (isStaticRequest(request, url)) {
+    trace.tier = "static";
     response = await serveStatic(request, url, ctx, trace);
   } else {
     // 三档分流只在 classifyTier 一处判定，handler 只负责转派。
-    switch (classifyTier(request, url)) {
+    // 这里顺手把档位记进 trace（纯函数，重复调用无副作用）。
+    trace.tier = classifyTier(request, url);
+    switch (trace.tier) {
       case "anon":
         response = await serveAnonymous(request, url, ctx, trace);
         break;
