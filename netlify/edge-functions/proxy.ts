@@ -1725,12 +1725,30 @@ function processOrigin(
   rewriteCors(out, proxyOrigin);
   applyObserve(out, observe);
 
+  /**
+   * 2026-10-29：**排除内部的一致性 cookie**，否则成员级缓存永远 `bypass`。
+   *
+   * 站主实测：登录态页面响应里有一条
+   *     set-cookie: zhuge_d1bm=<bookmark>; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600
+   * 那是 Worker 给 D1 Sessions 做「读后写一致」的 bookmark，**每个文档请求都会发**。
+   * 而下面 `storable` 的判据是「响应里不能有任何 Set-Cookie」——于是这条与身份无关的
+   * 内部 cookie 把每一次登录态响应都判成不可缓存 ⇒ 成员级边缘缓存**永久静默失效**。
+   *
+   * 为什么放行它是安全的：
+   *   · 成员桶的键含 uid（`buildUserCacheKey`），回放只会回放给**同一个人**；
+   *   · 匿名桶本来就不带这条 cookie（源站只在可缓存键为空时才发它）；
+   *   · 它是会话内的一致性提示，过期了最坏是读到稍旧数据，与缓存本身的年龄同量级。
+   */
+  const blockingCookies = cookies.filter(
+    (cookie) => !cookie.trim().toLowerCase().startsWith("zhuge_d1bm="),
+  );
+
   const storable =
     plan !== null &&
     method === "GET" &&
     res.status === 200 &&
     res.body !== null &&
-    cookies.length === 0 &&
+    blockingCookies.length === 0 &&
     isStorable(res.headers) &&
     // 用户桶：源站没打 X-Zhuge-Cache-Tier: user 就不许写（匿名桶 requireUserMark=false，不受影响）
     (!plan.requireUserMark || isUserMarked(res.headers));
