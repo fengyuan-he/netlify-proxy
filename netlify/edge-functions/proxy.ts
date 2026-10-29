@@ -107,6 +107,16 @@
 //     说明是同一 isolate 上在缓存后端排队 / 冷连接；换了 iso 才变慢，说明是新 isolate 的冷启动。
 //     降级语义不变：open 失败时把句柄槽位置回 null（下一个请求重试），本次按「这一档没有缓存」走，
 //     四个调用点照旧各自 catch，绝不 5xx。
+// 52. `.data` / `.rsc`（React Router single-fetch 数据流）纳入缓存，但**只进 Cache API、不进镜像**。
+//     背景：页面首开有缓存（1~6ms），站内跳转却每次回源（几百毫秒）——因为 `.data` 被
+//     `isCacheableTarget` 一刀切排除了，而用户感知的"点一下要等一下"恰恰来自这里。
+//     为什么可以缓存：它和页面用**同一套键**（成员档 = uidHash + epoch + 主题 + URL），
+//     所以不会串号；而任何非 GET 成功都会 `await bumpEpoch`，自己写完立刻换钥匙，不会长期陈旧。
+//     为什么不能进镜像：`.data` 的键空间是碎的（`/post/1.data?_routes=a,b` 每个组合一条），
+//     塞进只有 64 个名额的 isolate 镜像会把 HTML 的热点挤掉。Cache API 是节点共享池，不怕碎键。
+//     没有发现 loader 返回一次性密钥（唯一的是 /duet/gate 的验证码 nonce，那条流程已下线）。
+// 53. `.data` 的 Accept 是 `text/x-component`，不走 `acceptsHtml`；`isStorable` 也相应接受
+//     `text/x-component` / `text/x-script` 两种 turbo-stream 类型。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -788,7 +798,10 @@ function readSessionCookie(request: Request): string | null {
 /** 路径 / 查询参数层面「允不允许进缓存」：两档共用同一套黑名单。 */
 function isCacheableTarget(url: URL): boolean {
   const path = url.pathname;
-  if (path.endsWith(".data") || path.endsWith(".rsc")) return false;
+  // 2026-10-29（第 55 条）：`.data` / `.rsc` **放开**。
+  // 它们是 React Router 的 single-fetch 数据流，和页面走同一套「uid + epoch + 主题」键，
+  // 自己写完 epoch 立刻换钥匙，所以不会串号也不会长期陈旧。
+  // 唯一的额外约束在别处：**只进 Cache API，不进 isolate 内存镜像**（键空间太碎）。
   if (path.startsWith("/assets/") || path.startsWith("/img/") || path.startsWith("/cdn-cgi/")) return false;
   for (const prefix of PRIVATE_PATH_PREFIXES) {
     if (path === prefix || path.startsWith(`${prefix}/`)) return false;
@@ -918,6 +931,30 @@ function acceptsHtml(header: string): boolean {
   return value.includes("text/html") || value.includes("*/*");
 }
 
+/**
+ * 请求是不是 React Router 的 single-fetch 数据流（`.data` / `.rsc`）。
+ *
+ * 它和页面走**同一套缓存机制**，但有两点不同（见第 55 条）：
+ *   · 只进 Cache API，**不进 isolate 内存镜像**（键空间太碎，会把镜像的名额挤爆）；
+ *   · `Accept` 是 `text/x-component`，不经过 `acceptsHtml`，所以要单独认。
+ */
+function acceptsSingleFetch(header: string): boolean {
+  const value = header.trim().toLowerCase();
+  if (value.length === 0) return false;
+  return value.includes("text/x-component") || value.includes("text/x-script");
+}
+
+/**
+ * 这个路径是不是 single-fetch 数据流（`.data` / `.rsc`）。
+ *
+ * 用途只有一个：**把它挡在 isolate 内存镜像之外**（第 55 条）。
+ * `.data` 的键空间碎（`/post/1.data?_routes=a,b` 每个组合一条），
+ * 放进只有 64 个名额的镜像会把 HTML 的热点挤掉；而 Cache API 是共享池，不怕碎键。
+ */
+function isSingleFetchPath(pathname: string): boolean {
+  return pathname.endsWith(".data") || pathname.endsWith(".rsc");
+}
+
 function isCacheable(request: Request, url: URL): boolean {
   if (request.method !== "GET") return false;
 
@@ -925,8 +962,10 @@ function isCacheable(request: Request, url: URL): boolean {
   if (headers.has("cookie") || headers.has("authorization") || headers.has("range") || headers.has("upgrade")) {
     return false;
   }
-  // `text/html` 或 `*/*` 都算页面请求（见 acceptsHtml 里的安全说明）。
-  if (!acceptsHtml(headers.get("accept") ?? "")) return false;
+  // `text/html` 或 `*/*` 都算页面请求（见 acceptsHtml 里的安全说明）；
+  // `.data` / `.rsc` 的 `Accept` 是 `text/x-component`，单独认（第 55 条）。
+  const accept = headers.get("accept") ?? "";
+  if (!acceptsHtml(accept) && !acceptsSingleFetch(accept)) return false;
   // 缓存条目固定 gzip，只服务能解 gzip 的客户端。
   if (!acceptsGzip(headers.get("accept-encoding") ?? "")) return false;
 
@@ -943,6 +982,9 @@ function isMemberCacheable(request: Request, url: URL): boolean {
   const headers = request.headers;
   if (headers.has("authorization") || headers.has("range") || headers.has("upgrade")) return false;
   if (!acceptsGzip(headers.get("accept-encoding") ?? "")) return false;
+  // 成员档同样要认 `.data`（第 55 条）：它的 Accept 不是 text/html，但同样是 GET + 可缓存。
+  const accept = headers.get("accept") ?? "";
+  if (!acceptsHtml(accept) && !acceptsSingleFetch(accept)) return false;
   return isCacheableTarget(url);
 }
 
@@ -1398,7 +1440,13 @@ function isUserMarked(headers: Headers): boolean {
 
 function isStorable(headers: Headers): boolean {
   const contentType = (headers.get("content-type") ?? "").toLowerCase();
-  if (!contentType.includes("text/html")) return false;
+  // 2026-10-29（第 55 条）：除了 HTML，也接受 React Router single-fetch 的数据流类型。
+  // turbo-stream 用 `text/x-component`；`.rsc` 在某些版本是 `text/x-script` 或 `text/plain`。
+  const storableType =
+    contentType.includes("text/html") ||
+    contentType.includes("text/x-component") ||
+    contentType.includes("text/x-script");
+  if (!storableType) return false;
   const cacheControl = (headers.get("cache-control") ?? "").toLowerCase();
   if (cacheControl.includes("no-store")) return false; // 只有 no-store 是硬拒绝，private/no-cache 放行
   if ((headers.get("vary") ?? "").trim() === "*") return false;
@@ -1786,7 +1834,8 @@ function processOrigin(
      * 后台读，绝不拖慢这次响应：客户端那条分支完全不受影响。
      */
     let toPut = toCache;
-    if (!plan.requireUserMark && request !== undefined) {
+    // 第 55 条：`.data` / `.rsc` **只进 Cache API，不进镜像**（键太碎会把 64 个名额挤爆）。
+    if (!plan.requireUserMark && request !== undefined && !isSingleFetchPath(requestUrl.pathname)) {
       try {
         const [putBranch, mirrorBranch] = toCache.tee();
         toPut = putBranch;
@@ -1871,7 +1920,8 @@ async function probeAnonymous(request: Request, url: URL, ctx: Context, trace: T
 
   // 带跟踪参数的请求只读不写（第 5 条），也不进镜像：它们本来就不该被复用。
   // theme / engine 与 Cache API 键是同一组维度，只用于命中校验（不参与镜像键）。
-  let mirrorable = !hasTrackingParams(url);
+  // 第 55 条：`.data` / `.rsc` 只走 Cache API，镜像对它一律不查也不填。
+  let mirrorable = !hasTrackingParams(url) && !isSingleFetchPath(url.pathname);
   let mirrorKey = "";
   let theme = "";
   let engine = "";
