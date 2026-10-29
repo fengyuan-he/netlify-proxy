@@ -2923,6 +2923,26 @@ export default async function handler(request: Request, ctx: Context): Promise<R
     const keySuffix = cacheIdPath(url).slice(0, 160);
     const headers = new Headers(withTiming.headers);
     headers.set("x-proxy-key", keySuffix);
+    /**
+     * 2026-10-29（第 60 条）：区域 / isolate 诊断头。
+     *
+     * 为什么加：站主观察到 `x-proxy-epoch` 在三次请求里 0 → 2 → 1（**下降**），
+     * 而 epoch 只会被 `bumpEpoch` 递增。外部评估指出一个更可能的解释：
+     *
+     *   **Netlify 的 Cache API 是「按区域存储、不跨区域复制」的**
+     *   —— 每个区域各有一份 `ep/{uidHash}`，各自被 bump，请求落到哪个区域就读到哪个值。
+     *   所以 0 → 2 → 1 不需要"部署清空"或"并发覆盖"也能出现。
+     *
+     * 而我之前用 `cf-ray` 后缀（`-SIN`）排除"跨机房"是**错的**：
+     * `cf-ray` 是 Cloudflare 回源那一跳的机房，**不是 Netlify 边缘节点的区域**。
+     *
+     * 这两个头用来验证那个假设：连续刷同一页，把 (region, iso, epoch, cache) 记成表。
+     * 如果 **epoch 与 region 一一对应**，区域假设成立，修法就该走"让 epoch 无状态"。
+     *
+     * 只在这两个诊断里用现有变量，不新增任何状态、不影响任何逻辑。
+     */
+    headers.set("x-proxy-region", edgeRegion());
+    headers.set("x-proxy-iso", ISOLATE_ID);
     return new Response(withTiming.body, {
       status: withTiming.status,
       statusText: withTiming.statusText,
