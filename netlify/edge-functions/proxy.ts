@@ -132,8 +132,9 @@ const STATIC_FRESH_MS = 7 * 24 * 3_600_000; // 7 天：纯新鲜窗口（分档�
 const STATIC_SWR_MS = 30 * 24 * 3_600_000; // 30 天：SWR 窗口上界，同时就是硬过期点
 const STATIC_STORE_TTL_S = 30 * 24 * 3_600; // 30 天：= SWR；硬过期后由下一次请求删掉重取
 // 单个静态条目的大小上限：超过就不进缓存、直接回源透传（读入内存的上限，见第 47/49 条）。
-// 超过它的资源一律不缓冲 —— 静态档只缓存小文件，大图不值得为它把一个 isolate 的内存吃掉。
-const STATIC_MAX_CACHE_BYTES = 2 * 1024 * 1024;
+// 2026-10-29 站主："站里本来最大就 5mb" ⇒ 上限从 2MiB 提到 8MiB，覆盖上传上限并留余量。
+// 原来 2MiB 会把 4MB 的图挡在缓存外（而且超限分支没回退透传，直接断了连接）。
+const STATIC_MAX_CACHE_BYTES = 8 * 1024 * 1024;
 // 条目内部记录「实际写进缓存的字节数」：命中时用它校验完整性（不依赖会被框架/平台改写的 content-length）。
 const STATIC_BYTES = "x-proxy-bytes";
 // 键的内部固定 origin：不含 cookie / theme / epoch，也不与 cache.invalid 的两种 HTML 键重叠。
@@ -1719,10 +1720,11 @@ async function processStaticOrigin(
     return { response: withBody(res, out) };
   }
 
-  // 完整读入（上限 2MiB）。读失败 / 超限 / 中途断开都是 null，绝不拿半截去写缓存。
+  // 完整读入（上限 STATIC_MAX_CACHE_BYTES，现为 8MiB）。读失败 / 超限 / 中途断开都是 null，绝不拿半截去写缓存。
   const bytes = await readBodyCapped(res.body, STATIC_MAX_CACHE_BYTES);
   if (bytes === null || bytes.byteLength !== declared) {
-    // 源站 body 和 content-length 对不上（截断 / 超限）：不缓存，也不能把半截当 200 发出去。
+    // 源站 body 和 content-length 对不上（截断 / 超限 / 中途断开）：不缓存，也不能把半截当 200 发出去。
+    // 2026-10-29：改上限后这条只应在"源站真的截断"时命中；4MB 的图不再落这里。
     void discard(res);
     return { response: text(502, "Bad Gateway") };
   }
