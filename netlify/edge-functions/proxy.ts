@@ -44,6 +44,8 @@
 // 33. X-Zhuge-Cache-Tier 只做内部信号，回浏览器前删干净；对外只暴露 x-proxy-cache / x-proxy-user(8 位) / x-proxy-epoch。
 //     注意：源站另有一个 X-Zhuge-Cache（值为 hit，表示 Workers 边缘缓存命中），那是它自己的观测头，本文件不碰、也不据此判档。
 // 34. 用户桶命中时照旧回放源站原始 cache-control（通常 private, no-cache）：浏览器与 CDN 不得二次共享这份 HTML。
+// 35. Server-Timing 只在「本次真的回源」时透传源站段：缓存回放里的旧 d1/ssr/app 是上一次回源的数，
+//     透传等于把旧数冒充本次；本代理的 proxy;dur 每次都追加（缓存命中 = 整个函数耗时）。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -261,6 +263,7 @@ function reportTrace(
   cache: string,
   upstreamMs: number,
   totalMs: number,
+  proxyMs: number,
 ): void {
   if (TARGET_BASE.length === 0) return;
   try {
@@ -269,6 +272,9 @@ function reportTrace(
       cache,
       upstreamMs,
       totalMs,
+      // 2026-10-29：本代理自身耗时（Server-Timing 的 proxy;dur 同源），
+      // 源站 /api/trace 只是多收一个字段（它容忍多余字段），用来按天看趋势。
+      proxyMs,
       colo: trace.colo ?? "?",
     });
     ctx.waitUntil(
@@ -712,6 +718,65 @@ function withBody(res: Response, headers: Headers): Response {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
+/**
+ * ── Server-Timing（2026-10-29）──────────────────────────────────────────────
+ *
+ * 目标：让一次请求能拼出完整的分段表 ——
+ *   浏览器 DNS/TCP/TLS/TTFB（netcheck 已有，本文件不管）
+ *   → 反代内部 `proxy;dur`（本文件）
+ *   → 反代→Worker 往返（trace 的 `up`，已有）
+ *   → Worker 内部 `d1` / `ssr` / `app`（源站 Server-Timing，本文件透传）。
+ *
+ * `proxy;dur` = 「进 handler → 拿到回源响应头」减去 `up`（回源往返），即纯代理开销：
+ *   开缓存 / 算缓存键 / 算 uidHash / 收 POST body / 改 Location·Set-Cookie / tee body …
+ * 没有回源（缓存命中）时 = 整个函数耗时（那时全是代理开销）。
+ *
+ * 合并按 RFC 8941 的列表语义：源站指标在前，逗号 + `proxy;dur` 追加在后；源站一个都没有时
+ * 只输出 `proxy;dur`（补位，不是覆盖）。上限 5 个指标：源站固定 3 个（d1/ssr/app）+ 代理 1 个
+ * = 4 个；万一源站以后加指标，这里会把多出来的截掉，保证不超限。
+ *
+ * ⚠️ 只有**本次真的回源了**才透传源站的段（`inherit=false` 时丢掉）：
+ * 缓存条目里存着「当初那次回源」的 d1/ssr/app，回放时那不是本次的耗时，留着就是把旧数冒充本次。
+ * 判据用现成的 `x-proxy-cache` 档位（hit / stale* 都是回放；miss / bypass 才是新回源），
+ * 这样不用碰缓存回放逻辑（fromCache）。
+ *
+ * 整个函数包在 try 里：计时/改头任何异常都原样返回响应 —— 计时绝不能影响响应。
+ */
+const MAX_SERVER_TIMING_METRICS = 5;
+
+/** 按逗号切 Server-Timing，但**不切引号内**的逗号（`desc="a,b"` 是合法写法）。 */
+function splitServerTiming(raw: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let quoted = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw.charAt(i);
+    if (ch === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (quoted || ch !== ",") continue;
+    parts.push(raw.slice(start, i));
+    start = i + 1;
+  }
+  parts.push(raw.slice(start));
+  return parts.map((part) => part.trim()).filter((part) => part.length > 0);
+}
+
+function withServerTiming(res: Response, proxyMs: number, inheritOriginTiming: boolean): Response {
+  try {
+    const headers = new Headers(res.headers);
+    const inherited = inheritOriginTiming
+      ? splitServerTiming(headers.get("server-timing") ?? "").slice(0, MAX_SERVER_TIMING_METRICS - 1)
+      : [];
+    inherited.push(`proxy;dur=${Math.max(0, Math.round(proxyMs))}`);
+    headers.set("server-timing", inherited.join(", "));
+    return withBody(res, headers);
+  } catch {
+    return res;
+  }
+}
+
 /** 命中缓存时回放：cache-control 用源站原值，绝不让这份 HTML 被浏览器/CDN 二次共享。 */
 function fromCache(hit: Response, state: string, ageMs: number, observe?: Observe): Response {
   const headers = new Headers(hit.headers);
@@ -1041,19 +1106,28 @@ export default async function handler(request: Request, ctx: Context): Promise<R
       response = await serveDirect(request, url, trace);
   }
 
-  // ── 链路追踪上报（tEnd 在这里：返回响应前）───────────────────────────────
-  // 只读时间与响应头（x-proxy-cache / cf-ray），**绝不改响应、绝不加头、绝不影响返回**。
+  // ── 链路追踪上报 + 分段计时（tEnd 在这里：返回响应前）────────────────────
+  // 追踪上报只读时间与响应头（x-proxy-cache / cf-ray），绝不改响应、失败完全静默；
+  // Server-Timing 是唯一会写响应头的东西（withServerTiming，内部全 try/catch）。
+  const tEnd = Date.now();
+  const totalMs = Math.max(0, tEnd - t0);
+  // 反代 → Worker 往返：发起回源到拿到响应头；没有回源（缓存命中）时为 0。
+  const upstreamMs = trace.tFetch === undefined ? 0 : Math.max(0, (trace.tUp ?? tEnd) - trace.tFetch);
+  // 纯代理开销：进函数 → 发起回源（= (tUp - t0) - up，代数上就是 tFetch - t0）。
+  // 没有回源（缓存命中）= 整个函数耗时；回源失败（没拿到头）也只算到发起那一刻，不把等待算进来。
+  const proxyMs = trace.tFetch === undefined ? totalMs : Math.max(0, trace.tFetch - t0);
+  const cacheState = traceCacheState(response.headers.get(CACHE_STATE));
+  // 只有本次真的回源（miss / miss-user / bypass）才透传源站的 d1/ssr/app；
+  // 缓存回放（hit / stale*）里那份是「当初那次」的数，透传会把旧数冒充本次。
+  const originFresh = cacheState === "miss" || cacheState === "miss-user" || cacheState === "bypass";
   try {
-    const tEnd = Date.now();
-    const totalMs = tEnd - t0;
-    // 发起过回源、但响应头没回来（超时/网络错）时，把等待时间也算进上游耗时。
-    const upstreamMs = trace.tFetch === undefined ? 0 : Math.max(0, (trace.tUp ?? tEnd) - trace.tFetch);
     const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS;
     if (slow || Math.random() < TRACE_SAMPLE_RATE) {
-      reportTrace(ctx, trace, url, traceCacheState(response.headers.get(CACHE_STATE)), upstreamMs, totalMs);
+      reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs);
     }
   } catch {
     // 埋点自身任何异常一律吞掉：响应保持不变
   }
-  return response;
+  // Server-Timing：透传源站的 d1/ssr/app，追加本代理的 proxy;dur。
+  return withServerTiming(response, proxyMs, originFresh);
 }
