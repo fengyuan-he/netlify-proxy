@@ -3005,6 +3005,20 @@ export default async function handler(request: Request, ctx: Context): Promise<R
      */
     headers.set("x-proxy-region", edgeRegion());
     headers.set("x-proxy-iso", ISOLATE_ID);
+    /**
+     * 2026-10-30：**竞速腿数 + 各腿目标主机名**，用来确认"新版本到底部没部署上去、
+     * 第四路到底有没有配进环境变量"。
+     *
+     * 起因：加了 `TARGET_URL_ALT3` 之后，trace 里一直看不到 `race=origin4`。
+     * 光看 trace 无法区分两种情况：
+     *   a. 新代码没部署 / 环境变量没生效 ⇒ 根本没第四路；
+     *   b. 第四路存在但每次都比别人慢 ⇒ 存在但没赢过。
+     * 这两个的修法完全相反，所以必须能一眼看出腿数。
+     *
+     * 只暴露主机名（本来就是公网域名）与腿数，不含任何密钥。
+     */
+    headers.set("x-proxy-legs", String(RACE_LEGS));
+    headers.set("x-proxy-targets", ORIGIN_TARGETS.map((t) => t.host).join(","));
     return new Response(withTiming.body, {
       status: withTiming.status,
       statusText: withTiming.statusText,
