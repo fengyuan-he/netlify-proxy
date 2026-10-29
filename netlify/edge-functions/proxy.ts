@@ -117,6 +117,23 @@
 //     没有发现 loader 返回一次性密钥（唯一的是 /duet/gate 的验证码 nonce，那条流程已下线）。
 // 53. `.data` 的 Accept 是 `text/x-component`，不走 `acceptsHtml`；`isStorable` 也相应接受
 //     `text/x-component` / `text/x-script` 两种 turbo-stream 类型。
+//
+// ── 延迟写：回源赢了但探测还没结论（2026-10-29 站主实测）────────────────────
+// 54. 成员档「永远 miss-user、缓存永远填不进去」的根因不是写逻辑，而是**把「还不知道」当成了「不能」**：
+//     · probeMember 是**两次串行 Cache API 操作**（readEpoch + match），站主实测 16~380ms；
+//     · 而回源只要 100~140ms ⇒ 回源几乎总是先赢，decision.probe 为 null，
+//       processOrigin 收到的 plan 就是 null；
+//     · 原早退分支把 plan === null 直接当成「不能缓存」，于是这次响应既不写、也不保留探测结果
+//       （probeP 稍后完成只会被 discardProbe 丢掉）⇒ 下一次照样 miss，再次回源先赢，无限循环。
+//     匿名档没事，因为 probeAnonymous 只有一次 match（约 8ms），基本总在回源之前给出 plan。
+//     修法——「延迟写」：回源赢了、plan 还没到、但**其它写入判据现在就已经全部成立**时不要早退：
+//       a. 先用 readBodyCapped 把 body 读成一段字节（≤ MAX_STORE_BYTES），客户端响应立刻用这段
+//          字节构造（因此不会被「等 plan / 等 put」拖慢）；
+//       b. 后台等 deferred.probe 给出 plan：null 就什么都不做；用户桶还要求源站打标；
+//          否则按既有 storeHeaders 逻辑构造条目并 put。
+//     为什么必须挂 waitUntil：响应一返回，运行时会结束函数执行并取消后台任务 —— 不挂 waitUntil
+//     的 put 等于没写（还会变成 unhandled rejection）。所以 processOrigin 这次把 ctx 也拿进来。
+//     为什么只在 plan === null 时走：plan 已经有值时原逻辑一行不动，延迟写只补「未知」这一个洞。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -240,6 +257,12 @@ const USER_SWR_MS = 300_000; // 300s
 const USER_HARD_STALE_MS = 600_000; // 600s
 const USER_STORE_TTL_S = 720; // 必须 > USER_HARD_STALE_MS
 const EPOCH_TTL_S = 7 * 24 * 3_600; // epoch 条目必须活得比任何页面条目都久
+
+// ── 第 54 条：延迟写的内存上限 ──────────────────────────────────────────────
+// 回源赢了但 plan 还没到时，要把整条 body 读进内存才能「先响应、后写缓存」；
+// 沿用静态档同一个 8MiB 尺度（页面 HTML 即使 gzip 也只有几十 KB，这个上限只是防病态响应）。
+// 超限就不写，绝不硬存；能从 content-length 提前看出来的，连读都不读，直接走原早退路径。
+const MAX_STORE_BYTES = 8 * 1024 * 1024;
 
 // ── 第四档（静态资源）窗口：与上面两组完全独立，改这里不影响 anon / user 任何一档 ──
 // v2（2026-10-29）：条目语义从「源站给什么编码就存什么」改成「只存 identity」，
@@ -408,6 +431,15 @@ type StorePlan = {
 
 /** 只用于观测的请求上下文（用户桶）：绝不包含完整 cookie 或完整 hash。 */
 type Observe = { user?: string; epoch?: number };
+
+/**
+ * 第 54 条：回源已经赢了、但缓存探测还没结论时，交给 processOrigin 的「迟到计划」。
+ * `probe` 就是 serveAnonymous / serveMember 里那条 probeP：它稍后会给出真正的 StorePlan
+ * （probeMember 的 readEpoch + match 是两次串行 Cache API 操作，常比回源慢）。
+ */
+type DeferredStore = {
+  probe: Promise<CacheProbe>;
+};
 
 /**
  * 链路追踪打点（2026-10-29）：只记时间，不改任何现有逻辑。
@@ -1375,6 +1407,13 @@ async function finishOriginRace(
   unstoredState?: string,
   /** 透传给 processOrigin，用于回源成功后直接填镜像（算 theme / engine 维度）。 */
   request?: Request,
+  /**
+   * 第 54 条：回源赢了、缓存探测还没结论时透传 probeP，交给 processOrigin 做「延迟写」。
+   * 只有 `decision.probe === null`（plan 未知）时调用方才会传它。
+   */
+  deferred?: DeferredStore,
+  /** 第 54 条：延迟写的 put 必须挂 waitUntil，否则响应返回后会被平台取消。 */
+  ctx?: Context,
 ): Promise<OriginFinishing> {
   // up = 赢家那一路的实际耗时（从它自己发起 fetch 算起）。
   trace.tUp = (trace.tFetch ?? Date.now()) + winner.ms;
@@ -1388,7 +1427,7 @@ async function finishOriginRace(
   if (probe?.stale !== undefined) await discard(probe.stale.res);
   if (probe?.hit !== undefined) await discard(probe.hit.res); // 缓存后到，本次已经用回源
 
-  const { response, stored } = processOrigin(
+  const { response, stored } = await processOrigin(
     winner.res,
     requestUrl,
     proxyOrigin,
@@ -1397,6 +1436,8 @@ async function finishOriginRace(
     observe,
     unstoredState,
     request,
+    deferred,
+    ctx,
   );
   return { kind: "response", response, stored };
 }
@@ -1744,7 +1785,7 @@ function userStorePlan(cache: Cache, key: Request): StorePlan {
   return { cache, key, ttlSeconds: USER_STORE_TTL_S, requireUserMark: true, missState: "miss-user" };
 }
 
-function processOrigin(
+async function processOrigin(
   res: Response,
   requestUrl: URL,
   proxyOrigin: string,
@@ -1758,7 +1799,14 @@ function processOrigin(
    * 传不进来就跳过填镜像（安全降级，绝不影响响应）。
    */
   request?: Request,
-): OriginOutput {
+  /**
+   * 第 54 条：回源赢了、缓存探测还没结论时（plan 必然还是 null）带上那条 probeP，
+   * 走「延迟写」——先读 body 发响应，再在后台等 plan 决定写不写。plan 已有值时不使用。
+   */
+  deferred?: DeferredStore,
+  /** 第 54 条：延迟写的 put 必须挂 waitUntil，否则响应返回后会被平台取消（等于没写）。 */
+  ctx?: Context,
+): Promise<OriginOutput> {
   const out = buildResponseHeaders(res, requestUrl, method);
 
   const cookies = getSetCookies(res.headers);
@@ -1790,6 +1838,97 @@ function processOrigin(
   const blockingCookies = cookies.filter(
     (cookie) => !cookie.trim().toLowerCase().startsWith("zhuge_d1bm="),
   );
+
+  /**
+   * 第 54 条：**「还不知道」不是「不能缓存」**。
+   * 走到这里且 plan === null，只可能是回源赢了、probe 还在跑（decision.probe === null）。
+   * 除 plan 之外的所有写入判据现在就能确定；都成立就不要早退，改为「延迟写」。
+   */
+  const declaredBodyLength = parseDeclaredLength(res.headers.get("content-length"));
+  if (
+    plan === null &&
+    deferred !== undefined &&
+    ctx !== undefined &&
+    method === "GET" &&
+    res.status === 200 &&
+    res.body !== null &&
+    blockingCookies.length === 0 &&
+    isStorable(res.headers) &&
+    // 长度声明已经超限：连读都不读，流原样留给下面的早退路径（一个字节不碰）。
+    (declaredBodyLength === null || declaredBodyLength <= MAX_STORE_BYTES)
+  ) {
+    /**
+     * 读的是 clone 而不是 res.body：readBodyCapped 超限时会 cancel reader，直接读原 body 的话
+     * 原流已被锁定/取消，下面的「退回原来早退路径」就再也构造不出响应（Response 会抛）。
+     * clone 让原 body 保持可读 —— 读失败 / 超限时还能原样流式透传。
+     */
+    let bufferedBytes: Uint8Array<ArrayBuffer> | null = null;
+    try {
+      const buffered = res.clone();
+      if (buffered.body !== null) {
+        bufferedBytes = await readBodyCapped(buffered.body, MAX_STORE_BYTES);
+      }
+    } catch {
+      bufferedBytes = null;
+    }
+
+    // 读失败 / 超限：退回原来的早退路径（与 plan === null 时逐字一致），绝不硬存半截。
+    if (bufferedBytes === null) {
+      out.set(CACHE_STATE, unstoredState !== undefined ? unstoredState : "bypass");
+      return { response: withBody(res, out) };
+    }
+
+    const bodyBytes = bufferedBytes; // const 收窄：后面的后台任务要用它
+    void discard(res); // 已拿到完整字节，原分支不再需要
+    out.delete("content-length"); // body 已由我们自己重新构造，帧长交给运行时（第 10 条）
+    // 客户端这一发本来就「缓存未命中」（只是探测还没跑完）：如实标 miss / miss-user，
+    // 与原来 plan === null 时的取值逐字一致，不因为「稍后可能会写」而谎报 hit。
+    out.set(CACHE_STATE, unstoredState !== undefined ? unstoredState : "bypass");
+
+    // 客户端响应立刻用这段字节构造：不等 plan、不等 put（响应只被「读完 body」影响，见第 54 条）。
+    const clientResponse = new Response(bodyBytes, {
+      status: 200,
+      statusText: res.statusText,
+      headers: out,
+    });
+
+    /**
+     * 后台延迟写：plan 到了且允许写，就按既有 storeHeaders 逻辑构造条目并 put。
+     * 任何异常一律吞掉 —— 延迟写失败只是这次没缓存，绝不 5xx、绝不留 unhandled rejection。
+     * 必须挂 waitUntil：响应返回后运行时才会继续执行任务，否则任务会被平台取消（等于没写）。
+     */
+    const lateProbe = deferred.probe;
+    waitUntil(
+      ctx,
+      (async () => {
+        const latePlan = (await lateProbe).plan;
+        if (latePlan === null) return; // 探测结论是「不写」（缓存不可用 / 带跟踪参数 / 负缓存）
+        // 用户桶：源站没打 X-Zhuge-Cache-Tier: user 就不许写（匿名桶 requireUserMark=false）。
+        if (latePlan.requireUserMark && !isUserMarked(res.headers)) return;
+
+        // 与下面 plan 已有值时的 storeHeaders 逐条一致。
+        const storeHeaders = new Headers(out);
+        storeHeaders.set(ORIGIN_CC, out.get("cache-control") ?? "");
+        storeHeaders.set("cache-control", `public, max-age=${latePlan.ttlSeconds}`);
+        storeHeaders.set(BORN, String(Date.now()));
+        storeHeaders.delete(CACHE_STATE);
+        storeHeaders.delete(CACHE_AGE);
+        storeHeaders.delete(USER_STATE);
+        storeHeaders.delete(EPOCH_STATE);
+
+        await latePlan.cache.put(
+          latePlan.key,
+          new Response(bodyBytes, { status: 200, statusText: res.statusText, headers: storeHeaders }),
+        );
+        // 与既有写入成功一致：让匿名档负缓存失效，否则刚写进去的条目 3 秒内没人看得见（第 50 条）。
+        if (!latePlan.requireUserMark) mirrorForgetMiss(requestUrl);
+      })().catch(() => {
+        // 延迟写失败静默：这次没缓存而已，客户端响应早已交出去了。
+      }),
+    );
+
+    return { response: clientResponse };
+  }
 
   const storable =
     plan !== null &&
@@ -1884,7 +2023,7 @@ async function refresh(job: RefreshJob): Promise<void> {
     const proxyOrigin = new URL(job.request.url).origin;
     const target = canonicalUrl(job.url); // 与 key 对齐，避免把带跟踪参数的渲染结果写回规范条目
     const res = await fetchOrigin(job.request, target, { forceGzip: true, canonicalReferer: true });
-    const { response, stored } = processOrigin(res, target, proxyOrigin, job.plan, "GET", job.observe);
+    const { response, stored } = await processOrigin(res, target, proxyOrigin, job.plan, "GET", job.observe);
     await discard(response); // 后台刷新没有人消费客户端分支
     if (stored !== undefined) await stored;
   } catch {
@@ -2093,6 +2232,9 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: T
     // 负缓存命中（第 50 条）同理：没查 Cache API 不代表这一档是 bypass。
     decision.probe === null || decision.probe.missMirror === true ? "miss" : undefined,
     request,
+    // 第 54 条：回源赢了、plan 还没到（probe 是 null）→ 把 probeP 透传下去做延迟写。
+    decision.probe === null ? { probe: probeP } : undefined,
+    ctx,
   );
   if (finishing.kind === "stale") return fromCache(finishing.stale.res, "stale-error", finishing.stale.ageMs);
   if (finishing.stored !== undefined) waitUntil(ctx, finishing.stored);
@@ -2233,6 +2375,10 @@ async function serveMember(request: Request, url: URL, ctx: Context, trace: Trac
     // 缓存还没就绪就输给了回源：如实标 miss-user，别退化成 bypass（本档是用户桶）。
     decision.probe === null ? "miss-user" : undefined,
     request,
+    // 第 54 条：成员档的 probeMember 是 epoch + match 两次串行 Cache API（16~380ms），
+    // 回源（100~140ms）几乎总是先赢 —— 这里把 probeP 透传下去，让回源响应也能延迟写。
+    decision.probe === null ? { probe: probeP } : undefined,
+    ctx,
   );
   if (finishing.kind === "stale") {
     return fromCache(finishing.stale.res, "stale-error-user", finishing.stale.ageMs, observe);
@@ -2267,7 +2413,7 @@ async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Re
       await bumpEpochForRequest(request);
     }
 
-    const { response } = processOrigin(originRes, url, proxyOrigin, null, request.method);
+    const { response } = await processOrigin(originRes, url, proxyOrigin, null, request.method);
     return response;
   }
 
