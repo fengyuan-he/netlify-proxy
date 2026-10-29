@@ -46,6 +46,12 @@
 // 34. 用户桶命中时照旧回放源站原始 cache-control（通常 private, no-cache）：浏览器与 CDN 不得二次共享这份 HTML。
 // 35. Server-Timing 只在「本次真的回源」时透传源站段：缓存回放里的旧 d1/ssr/app 是上一次回源的数，
 //     透传等于把旧数冒充本次；本代理的 proxy;dur 每次都追加（缓存命中 = 整个函数耗时）。
+//
+// ── 三路竞速 + cacheMs 打点（2026-10-29）────────────────────────────────────
+// 36. GET 一律「缓存 + 两路回源」三路竞速，谁先成功用谁：慢的那一路（尤其卡住的 Cache API）不再拖住用户，
+//     同时 cacheMs 把「进函数 → 缓存查询结束」单独报出来，回溯 11s 到底卡在缓存还是建连。
+// 37. 非 GET 一律不竞速：写操作翻倍且无法取消，只能原样单路。
+// 38. 缓存命中时也照样白跑两路回源（发起后立刻 abort）：这是站主明确接受的代价，换来的是「缓存慢也不慢」。
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { Context } from "@netlify/edge-functions";
@@ -187,10 +193,14 @@ type Trace = {
   tCache?: number;
   /** 发起回源 fetch 的时刻；没有回源（缓存命中）时为空。 */
   tFetch?: number;
-  /** 回源响应头到达（fetch 返回那一刻）。 */
+  /** 回源响应头到达（fetch 返回那一刻）；竞速时 = 赢家那一路的耗时。 */
   tUp?: number;
   /** 回源响应头 cf-ray 的后缀（`a51a…-HKG` → `HKG`），拿不到就是 `?`。 */
   colo?: string;
+  /** 三路竞速的赢家；没竞速（非 GET）时是 `none`。 */
+  race?: "cache" | "origin1" | "origin2" | "none";
+  /** 缓存查询最终完成（即使响应已经返回）：回源先赢时用它补报真实的 cacheMs。 */
+  cacheSettled?: Promise<void>;
 };
 
 /** 慢请求判定阈值：上游 > 800ms 或 总时长 > 2000ms 必报；其余按 2% 随机采样对照。 */
@@ -265,26 +275,43 @@ function reportTrace(
   upstreamMs: number,
   totalMs: number,
   proxyMs: number,
+  cacheMs: number,
+  race: string,
 ): void {
   if (TARGET_BASE.length === 0) return;
   try {
+    const path = normalizeTracePath(requestUrl.pathname);
     const body = JSON.stringify({
-      path: normalizeTracePath(requestUrl.pathname),
+      path,
       cache,
       upstreamMs,
       totalMs,
       // 2026-10-29：本代理自身耗时（Server-Timing 的 proxy;dur 同源），
       // 源站 /api/trace 只是多收一个字段（它容忍多余字段），用来按天看趋势。
       proxyMs,
+      // 2026-10-29：进函数 → 缓存查询结束（含 caches.open / match，用户档还含 epoch 读取）。
+      // 直连档没有缓存查询，恒为 0。
+      cacheMs,
+      // 2026-10-29：三路竞速的赢家（cache / origin1 / origin2）；非 GET 没竞速，记 none。
+      race,
       colo: trace.colo ?? "?",
     });
-    ctx.waitUntil(
-      fetch(`${TARGET_BASE}/api/trace`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      }).catch(() => {}),
+    // 一行结构化日志：Netlify 函数日志里 grep `[trace]` 就能直接看出慢在哪一段。
+    console.log(
+      `[trace] cache=${cache} up=${upstreamMs}ms total=${totalMs}ms proxy=${proxyMs}ms cacheMs=${cacheMs}ms colo=${trace.colo ?? "?"} path=${path}`,
     );
+    // 先把请求发出去，再尝试挂到 waitUntil 上：补报（响应已经交出后才上报）时
+    // waitUntil 窗口可能已经关了，此时请求至少已经发出，不会被这段 try 吞掉。
+    const send = fetch(`${TARGET_BASE}/api/trace`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    }).catch(() => {});
+    try {
+      ctx.waitUntil(send);
+    } catch {
+      // 窗口已关：send 已经在飞，能到就到
+    }
   } catch {
     // 没有 waitUntil 的运行时 / fetch 同步抛错：埋点失败绝不影响用户响应
   }
@@ -575,6 +602,8 @@ type OriginOptions = {
   forceGzip: boolean;
   /** 用「自身地址」做 referer：确定性，避免把别处的来源写进缓存。 */
   canonicalReferer: boolean;
+  /** 竞速时由每一路自己的 controller 提供：外部 abort 会连带 abort 这里 15s 的超时定时器。 */
+  signal?: AbortSignal;
 };
 
 async function fetchOrigin(request: Request, url: URL, options: OriginOptions): Promise<Response> {
@@ -623,6 +652,13 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ORIGIN_TIMEOUT_MS);
+  // 竞速时外面那一个 controller 也要能立刻掐断这一路；两边的 abort 合流到同一个 controller。
+  const external = options.signal;
+  const onExternalAbort = (): void => controller.abort();
+  if (external !== undefined) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener("abort", onExternalAbort, { once: true });
+  }
   try {
     return await fetch(target, {
       method: request.method,
@@ -633,7 +669,188 @@ async function fetchOrigin(request: Request, url: URL, options: OriginOptions): 
     });
   } finally {
     clearTimeout(timer); // 只做响应头超时，body 继续正常流式读取
+    external?.removeEventListener("abort", onExternalAbort);
   }
+}
+
+/* ── 三路竞速：缓存 + 两路回源（2026-10-29）─────────────────────────────── */
+
+type OriginWinner = { res: Response; label: "origin1" | "origin2"; ms: number };
+
+type OriginRace = {
+  /** 第一路成功返回的回源（含它自己的耗时）；两路都失败时 reject，错误原样交给调用方。 */
+  winner: Promise<OriginWinner>;
+  /** 缓存先赢 / 已经不用回源：立刻 abort 两路里还没回来的那些（缓存本身没法 abort，忽略即可）。 */
+  abort: () => void;
+};
+
+/**
+ * 启动两路回源竞速（只给 GET 用）：
+ *   o1 = fetchOrigin(req)
+ *   o2 = fetchOrigin(req.clone())
+ * 谁先成功用谁，赢家一出现立刻 abort 另外一路。
+ * 失败不在这里吞：两路都 reject 时 winner 也 reject，调用方照旧走 502 / stale 错误路径。
+ */
+function startOriginRace(request: Request, url: URL, options: OriginOptions): OriginRace {
+  const labels = ["origin1", "origin2"] as const;
+  const controllers: AbortController[] = [new AbortController(), new AbortController()];
+  let decided = false;
+  let abandoned = false;
+  let settledWinner: OriginWinner | null = null;
+
+  const legs: Array<Promise<OriginWinner>> = controllers.map((controller, index) => {
+    // 第二路用 clone：两路各消费自己的 body（GET 没有 body，这里照样 clone，
+    // 免得以后被复用到带 body 的方法上时两路互相锁死）。
+    const attempt = index === 0 ? request : request.clone();
+    const startedAt = Date.now();
+    return fetchOrigin(attempt, url, { ...options, signal: controller.signal }).then((res) => {
+      const value: OriginWinner = {
+        res,
+        label: labels[index] as "origin1" | "origin2",
+        ms: Math.max(0, Date.now() - startedAt),
+      };
+      if (decided) {
+        // 已经有人赢了：这一路白跑，body 立刻取消，别留一条没人读的流。
+        void discard(res);
+      } else {
+        decided = true;
+        // 赢家出现 → 立刻 abort 另一路；缓存那一路没法 abort，忽略。
+        for (let i = 0; i < controllers.length; i += 1) {
+          if (i !== index) controllers[i]?.abort();
+        }
+      }
+      return value;
+    });
+  });
+
+  const winner = Promise.any(legs);
+  // 缓存先赢时两路都会被 abort（两路都 reject）：这里先挂处理器，避免 unhandled rejection。
+  void winner.then(
+    (value) => {
+      settledWinner = value;
+      if (abandoned) void discard(value.res);
+    },
+    () => undefined,
+  );
+
+  return {
+    winner,
+    abort: () => {
+      abandoned = true;
+      for (const controller of controllers) controller.abort();
+      if (settledWinner !== null) void discard(settledWinner.res);
+    },
+  };
+}
+
+type CacheHit = { res: Response; state: string; ageMs: number };
+
+type CacheProbe = {
+  /** 命中且能直接回放（fresh / SWR）：缓存赢。 */
+  hit?: CacheHit;
+  /** 硬过期窗口内的旧副本：不赢，只在回源出错时兜底。 */
+  stale?: StaleHit;
+  /** 写缓存计划；null = 本次不写（打不开缓存 / 带跟踪参数 / 缓存还没就绪）。 */
+  plan: StorePlan | null;
+  /** 用户桶的 x-proxy-user / x-proxy-epoch 观测值（匿名档为 undefined）。 */
+  observe?: Observe;
+};
+
+type RaceDecision =
+  | { kind: "cache"; hit: CacheHit; probe: CacheProbe }
+  | { kind: "origin"; winner: OriginWinner; probe: CacheProbe | null }
+  | { kind: "origin-failed"; probe: CacheProbe | null };
+
+/** 竞速里用不到的缓存探测结果：把 body 放掉，别留两条没人读的流。 */
+function discardProbe(probe: CacheProbe): void {
+  if (probe.hit !== undefined) void discard(probe.hit.res);
+  if (probe.stale !== undefined) void discard(probe.stale.res);
+}
+
+/**
+ * 三路竞速的判定：缓存（probeP）与两路回源（race.winner）谁先给出可用结果。
+ *   · 缓存先赢（有可回放的命中）→ abort 两路回源，交给调用方回放；
+ *   · 回源先赢 → 另一路在 startOriginRace 里已经 abort；缓存没法 abort，忽略即可；
+ *   · 两路回源都失败 → 交给调用方走原来的错误路径。
+ */
+async function decideRace(race: OriginRace, probeP: Promise<CacheProbe>): Promise<RaceDecision> {
+  // 先挂快照：下面竞速用的 .then 挂得比它晚，所以 probe 先落地时快照一定已经有值。
+  let snapshot: CacheProbe | null = null;
+  const tracked = probeP.then((probe) => {
+    snapshot = probe;
+    return probe;
+  });
+
+  const first = await Promise.race([
+    tracked.then((probe) => ({ kind: "probe" as const, probe })),
+    race.winner.then(
+      (winner) => ({ kind: "origin" as const, winner }),
+      () => ({ kind: "failed" as const }),
+    ),
+  ]);
+
+  if (first.kind === "probe") {
+    if (first.probe.hit !== undefined) {
+      race.abort(); // 缓存先赢：两路回源立刻 abort
+      return { kind: "cache", hit: first.probe.hit, probe: first.probe };
+    }
+    // 没有可回放的命中（miss / 只有 stale 兜底）→ 等回源。
+    try {
+      return { kind: "origin", winner: await race.winner, probe: first.probe };
+    } catch {
+      return { kind: "origin-failed", probe: first.probe };
+    }
+  }
+
+  if (first.kind === "origin") {
+    if (snapshot === null) {
+      // 缓存那一路还在跑：本次已经用不到它的命中，跑完把 body 放掉。
+      void probeP.then(discardProbe, () => undefined);
+    }
+    return { kind: "origin", winner: first.winner, probe: snapshot };
+  }
+
+  return { kind: "origin-failed", probe: snapshot };
+}
+
+type OriginFinishing =
+  | { kind: "response"; response: Response; stored?: Promise<void> }
+  | { kind: "stale"; stale: StaleHit };
+
+/** 回源赢家的统一收尾：stale 兜底判定 + processOrigin（写缓存逻辑原样复用）。 */
+async function finishOriginRace(
+  winner: OriginWinner,
+  probe: CacheProbe | null,
+  requestUrl: URL,
+  proxyOrigin: string,
+  method: string,
+  observe: Observe | undefined,
+  trace: Trace,
+  /** probe 还没就绪时的档位状态（miss / miss-user），见 processOrigin 的参数说明。 */
+  unstoredState?: string,
+): Promise<OriginFinishing> {
+  // up = 赢家那一路的实际耗时（从它自己发起 fetch 算起）。
+  trace.tUp = (trace.tFetch ?? Date.now()) + winner.ms;
+  trace.colo = traceColo(winner.res);
+  trace.race = winner.label;
+
+  if (isOriginError(winner.res.status) && probe?.stale !== undefined) {
+    await discard(winner.res);
+    return { kind: "stale", stale: probe.stale };
+  }
+  if (probe?.stale !== undefined) await discard(probe.stale.res);
+  if (probe?.hit !== undefined) await discard(probe.hit.res); // 缓存后到，本次已经用回源
+
+  const { response, stored } = processOrigin(
+    winner.res,
+    requestUrl,
+    proxyOrigin,
+    probe?.plan ?? null,
+    method,
+    observe,
+    unstoredState,
+  );
+  return { kind: "response", response, stored };
 }
 
 /* ── 响应处理 ───────────────────────────────────────────────────────────── */
@@ -844,6 +1061,8 @@ function processOrigin(
   plan: StorePlan | null,
   method: string,
   observe?: Observe,
+  /** plan 为空但有明确档位时（缓存还没就绪）用来如实标 miss / miss-user，而不是笼统的 bypass。 */
+  unstoredState?: string,
 ): OriginOutput {
   const out = buildResponseHeaders(res, requestUrl, method);
 
@@ -870,7 +1089,7 @@ function processOrigin(
     (!plan.requireUserMark || isUserMarked(res.headers));
 
   if (plan === null || !storable) {
-    out.set(CACHE_STATE, "bypass");
+    out.set(CACHE_STATE, plan === null && unstoredState !== undefined ? unstoredState : "bypass");
     return { response: withBody(res, out) };
   }
 
@@ -933,14 +1152,14 @@ function tagged(res: Response, observe: Observe): Response {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
-/* ── 档位一：匿名桶（先查缓存，命中就不回源）────────────────────────────── */
+/* ── 档位一：匿名桶（缓存与两路回源同时开跑，谁先成功用谁）────────────────── */
 
-async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
-  const proxyOrigin = url.origin;
-
+/** 匿名档的缓存探测：打不开 / match 抛错一律降级为「这一档没有缓存」，绝不 5xx。 */
+async function probeAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<CacheProbe> {
   let cache: Cache | null = null;
   let key: Request | null = null;
-  let stale: StaleHit | null = null;
+  let stale: StaleHit | undefined;
+  let hit: CacheHit | undefined;
 
   try {
     const openedCache = await caches.open(CACHE_NAME);
@@ -948,59 +1167,155 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: T
     cache = openedCache;
     key = cacheKey;
 
-    const hit = await openedCache.match(cacheKey);
+    const matched = await openedCache.match(cacheKey);
     trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
-    if (hit) {
+    if (matched) {
       // 命中时没有回源，但条目里存的就是当初的源站响应头（cf-ray 也在），
-      // 所以 colo 照样能取到；取不到就保持 "?"。
-      trace.colo = traceColo(hit);
-      const ageMs = entryAge(hit);
+      // 所以 colo 照样能取到；取不到就保持 "?"。已经由回源赢家写过就不覆盖。
+      if (trace.colo === undefined) trace.colo = traceColo(matched);
+      const ageMs = entryAge(matched);
 
-      if (ageMs < FRESH_MS) return fromCache(hit, "hit", ageMs);
-      if (ageMs < SWR_MS) {
+      if (ageMs < FRESH_MS) hit = { res: matched, state: "hit", ageMs };
+      else if (ageMs < SWR_MS) {
         waitUntil(ctx, refresh({ request, url, key: cacheKey, plan: anonStorePlan(openedCache, cacheKey) }));
-        return fromCache(hit, "stale", ageMs);
-      }
-      if (ageMs < HARD_STALE_MS) stale = { res: hit, ageMs }; // 先留着当兜底
+        hit = { res: matched, state: "stale", ageMs };
+      } else if (ageMs < HARD_STALE_MS) stale = { res: matched, ageMs }; // 先留着当兜底
       else {
         // 彻底过期：取消 body 顺手删条目，避免平台不执行 max-age 时缓存无限膨胀。
-        await discard(hit);
+        await discard(matched);
         waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
       }
     }
   } catch {
     cache = null;
-    key = null; // 拿不到缓存就降级为直连，绝不让缓存故障变成 5xx
+    key = null; // 缓存故障：本次不回写，绝不让缓存故障变成 5xx
   }
   if (trace.tCache === undefined) trace.tCache = Date.now(); // 缓存打不开 / 提前失败：查询也结束了
 
   // 跟踪参数请求只读不写：写进去的就是带参数的渲染结果。
   const writable = cache !== null && key !== null && !hasTrackingParams(url);
-  const plan: StorePlan | null = writable ? anonStorePlan(cache!, key!) : null;
+  return { hit, stale, plan: writable ? anonStorePlan(cache!, key!) : null };
+}
 
-  let originRes: Response;
-  try {
-    trace.tFetch = Date.now();
-    originRes = await fetchOrigin(request, url, { forceGzip: true, canonicalReferer: true });
-    trace.tUp = Date.now(); // 回源响应头到达
-    trace.colo = traceColo(originRes);
-  } catch {
-    if (stale !== null) return fromCache(stale.res, "stale-error", stale.ageMs);
+async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
+  const proxyOrigin = url.origin;
+
+  // ① 两路回源立刻出发：缓存查询（②）与它们并行，谁先给出可用结果谁赢。
+  //    能走到本档的一定是 GET（classifyTier 拦掉了其他方法），所以这里不用再判方法。
+  trace.tFetch = Date.now();
+  const race = startOriginRace(request, url, { forceGzip: true, canonicalReferer: true });
+
+  // ② 缓存查询与它并行；probe 兜成永不 reject（任何意外都退化成「这一档没缓存」）。
+  const probeP: Promise<CacheProbe> = probeAnonymous(request, url, ctx, trace).catch(
+    (): CacheProbe => ({ plan: null }),
+  );
+  trace.cacheSettled = probeP.then(
+    () => undefined,
+    () => undefined,
+  );
+
+  const decision = await decideRace(race, probeP);
+
+  // 结果一：缓存先赢 → 用缓存条目，两路回源在 decideRace 里已经 abort。
+  if (decision.kind === "cache") {
+    trace.race = "cache";
+    trace.tFetch = undefined; // 没有用上回源：up 记 0，proxy 退回整段函数耗时
+    trace.tUp = undefined;
+    return fromCache(decision.hit.res, decision.hit.state, decision.hit.ageMs);
+  }
+
+  // 结果二：两路回源都抛 → 走原来的错误路径（先等缓存那一路跑完，它可能正好有命中 / 旧副本）。
+  if (decision.kind === "origin-failed") {
+    const probe = decision.probe ?? (await probeP);
+    if (probe.hit !== undefined) {
+      trace.race = "cache";
+      trace.tFetch = undefined;
+      trace.tUp = undefined;
+      return fromCache(probe.hit.res, probe.hit.state, probe.hit.ageMs);
+    }
+    trace.race = "none";
+    if (probe.stale !== undefined) return fromCache(probe.stale.res, "stale-error", probe.stale.ageMs);
     return text(502, "Bad Gateway");
   }
 
-  if (isOriginError(originRes.status) && stale !== null) {
-    await discard(originRes);
-    return fromCache(stale.res, "stale-error", stale.ageMs);
+  // 结果三：回源先赢（正常的缓存未命中也是这条）→ 赢家响应原样返回，另一路已被 abort。
+  if (decision.probe === null) {
+    // 缓存那一路还在跑：本次已经用不上它的命中，跑完把 body 放掉（缓存没法 abort）。
+    void probeP.then(discardProbe, () => undefined);
   }
-  if (stale !== null) await discard(stale.res);
-
-  const { response, stored } = processOrigin(originRes, url, proxyOrigin, plan, "GET");
-  if (stored !== undefined) waitUntil(ctx, stored);
-  return response;
+  const finishing = await finishOriginRace(
+    decision.winner,
+    decision.probe,
+    url,
+    proxyOrigin,
+    "GET",
+    undefined,
+    trace,
+    // 缓存还没就绪就输给了回源：如实标 miss，别退化成 bypass（本档是匿名桶）。
+    decision.probe === null ? "miss" : undefined,
+  );
+  if (finishing.kind === "stale") return fromCache(finishing.stale.res, "stale-error", finishing.stale.ageMs);
+  if (finishing.stored !== undefined) waitUntil(ctx, finishing.stored);
+  return finishing.response;
 }
 
-/* ── 档位二：用户桶（先查带 epoch 的键，未命中才回源；写不写看响应头）──── */
+/* ── 档位二：用户桶（epoch 读完后与两路回源竞速；写不写照旧看响应头）──────── */
+
+/** 用户档的缓存探测：epoch 只读一次，之后写缓存全程用同一个值（第 27 条）。 */
+async function probeMember(
+  request: Request,
+  url: URL,
+  ctx: Context,
+  trace: Trace,
+  uidHash: string,
+  tag: string,
+): Promise<CacheProbe> {
+  let cache: Cache | null = null;
+  let key: Request | null = null;
+  let stale: StaleHit | undefined;
+  let hit: CacheHit | undefined;
+  let observe: Observe = { user: tag };
+
+  try {
+    const openedCache = await caches.open(CACHE_NAME);
+    // epoch 只在这里读一次，之后回源、写缓存全程用同一个值：
+    // 回源期间发生的写操作只会让新内容落到新 epoch，不会把旧 HTML 写进当前 epoch。
+    const epoch = await readEpoch(openedCache, uidHash);
+    const cacheKey = buildUserCacheKey(request, url, uidHash, epoch);
+    cache = openedCache;
+    key = cacheKey;
+    observe = { user: tag, epoch };
+
+    const matched = await openedCache.match(cacheKey);
+    trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
+    if (matched) {
+      // 同匿名档：命中条目里存着当初的源站响应头，cf-ray 可用。回源已经写过 colo 就不覆盖。
+      if (trace.colo === undefined) trace.colo = traceColo(matched);
+      const ageMs = entryAge(matched);
+
+      if (ageMs < USER_FRESH_MS) hit = { res: matched, state: "hit-user", ageMs };
+      else if (ageMs < USER_SWR_MS) {
+        waitUntil(
+          ctx,
+          refresh({ request, url, key: cacheKey, plan: userStorePlan(openedCache, cacheKey), observe }),
+        );
+        hit = { res: matched, state: "stale-user", ageMs };
+      } else if (ageMs < USER_HARD_STALE_MS) stale = { res: matched, ageMs };
+      else {
+        await discard(matched);
+        waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
+      }
+    }
+  } catch {
+    cache = null;
+    key = null;
+    stale = undefined; // 缓存故障时不留半截兜底：直连源站即可，绝不 5xx
+  }
+  if (trace.tCache === undefined) trace.tCache = Date.now(); // 缓存打不开 / 提前失败：查询也结束了
+
+  const writable = cache !== null && key !== null && !hasTrackingParams(url);
+  return { hit, stale, plan: writable ? userStorePlan(cache!, key!) : null, observe };
+}
 
 async function serveMember(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
   const proxyOrigin = url.origin;
@@ -1015,102 +1330,114 @@ async function serveMember(request: Request, url: URL, ctx: Context, trace: Trac
   }
 
   const tag = uidHash.slice(0, USER_TAG_LEN);
-  let observe: Observe = { user: tag };
 
-  let cache: Cache | null = null;
-  let key: Request | null = null;
-  let epoch = 0;
-  let stale: StaleHit | null = null;
+  // ① 两路回源立刻出发（uidHash 只是缓存键的一部分，回源不需要它）。
+  trace.tFetch = Date.now();
+  const race = startOriginRace(request, url, { forceGzip: true, canonicalReferer: true });
 
-  try {
-    const openedCache = await caches.open(CACHE_NAME);
-    // epoch 只在这里读一次，之后回源、写缓存全程用同一个值：
-    // 回源期间发生的写操作只会让新内容落到新 epoch，不会把旧 HTML 写进当前 epoch。
-    epoch = await readEpoch(openedCache, uidHash);
-    const cacheKey = buildUserCacheKey(request, url, uidHash, epoch);
-    cache = openedCache;
-    key = cacheKey;
-    observe = { user: tag, epoch };
+  // ② 缓存查询与它并行；probe 兜成永不 reject（任何意外都退化成「这一档没缓存」）。
+  const probeP: Promise<CacheProbe> = probeMember(request, url, ctx, trace, uidHash, tag).catch(
+    (): CacheProbe => ({ plan: null, observe: { user: tag } }),
+  );
+  trace.cacheSettled = probeP.then(
+    () => undefined,
+    () => undefined,
+  );
 
-    const hit = await openedCache.match(cacheKey);
-    trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
-    if (hit) {
-      // 同匿名档：命中条目里存着当初的源站响应头，cf-ray 可用。
-      trace.colo = traceColo(hit);
-      const ageMs = entryAge(hit);
+  const decision = await decideRace(race, probeP);
+  // 观测头：缓存那一路若还没跑完，只能先给 user、没有 epoch（不为了这个头拖响应）。
+  const observe: Observe = decision.probe?.observe ?? { user: tag };
 
-      if (ageMs < USER_FRESH_MS) return fromCache(hit, "hit-user", ageMs, observe);
-      if (ageMs < USER_SWR_MS) {
-        waitUntil(
-          ctx,
-          refresh({ request, url, key: cacheKey, plan: userStorePlan(openedCache, cacheKey), observe }),
-        );
-        return fromCache(hit, "stale-user", ageMs, observe);
-      }
-      if (ageMs < USER_HARD_STALE_MS) stale = { res: hit, ageMs };
-      else {
-        await discard(hit);
-        waitUntil(ctx, openedCache.delete(cacheKey).catch(() => false));
-      }
+  // 结果一：缓存先赢 → 用缓存条目，两路回源在 decideRace 里已经 abort。
+  if (decision.kind === "cache") {
+    trace.race = "cache";
+    trace.tFetch = undefined; // 没有用上回源：up 记 0，proxy 退回整段函数耗时
+    trace.tUp = undefined;
+    return fromCache(decision.hit.res, decision.hit.state, decision.hit.ageMs, observe);
+  }
+
+  // 结果二：两路回源都抛 → 走原来的错误路径（先等缓存那一路跑完，它可能正好有命中 / 旧副本）。
+  if (decision.kind === "origin-failed") {
+    const probe = decision.probe ?? (await probeP);
+    const fallbackObserve = probe.observe ?? observe;
+    if (probe.hit !== undefined) {
+      trace.race = "cache";
+      trace.tFetch = undefined;
+      trace.tUp = undefined;
+      return fromCache(probe.hit.res, probe.hit.state, probe.hit.ageMs, fallbackObserve);
     }
-  } catch {
-    cache = null;
-    key = null;
-    stale = null; // 缓存故障时不留半截兜底：直连源站即可，绝不 5xx
-  }
-  if (trace.tCache === undefined) trace.tCache = Date.now(); // 缓存打不开 / 提前失败：查询也结束了
-
-  const writable = cache !== null && key !== null && !hasTrackingParams(url);
-  const plan: StorePlan | null = writable ? userStorePlan(cache!, key!) : null;
-
-  let originRes: Response;
-  try {
-    // 用户桶同样强制 gzip + 规范化 referer：桶里只允许一种编码、一种来源形态。
-    trace.tFetch = Date.now();
-    originRes = await fetchOrigin(request, url, { forceGzip: true, canonicalReferer: true });
-    trace.tUp = Date.now(); // 回源响应头到达
-    trace.colo = traceColo(originRes);
-  } catch {
-    if (stale !== null) return fromCache(stale.res, "stale-error-user", stale.ageMs, observe);
-    return tagged(text(502, "Bad Gateway"), observe);
+    trace.race = "none";
+    if (probe.stale !== undefined) {
+      return fromCache(probe.stale.res, "stale-error-user", probe.stale.ageMs, fallbackObserve);
+    }
+    return tagged(text(502, "Bad Gateway"), fallbackObserve);
   }
 
-  if (isOriginError(originRes.status) && stale !== null) {
-    await discard(originRes);
-    return fromCache(stale.res, "stale-error-user", stale.ageMs, observe);
+  // 结果三：回源先赢（正常的缓存未命中也是这条）→ 赢家响应原样返回，另一路已被 abort。
+  if (decision.probe === null) {
+    // 缓存那一路还在跑：本次已经用不上它的命中，跑完把 body 放掉（缓存没法 abort）。
+    void probeP.then(discardProbe, () => undefined);
   }
-  if (stale !== null) await discard(stale.res);
-
-  const { response, stored } = processOrigin(originRes, url, proxyOrigin, plan, "GET", observe);
-  if (stored !== undefined) waitUntil(ctx, stored);
-  return response;
+  const finishing = await finishOriginRace(
+    decision.winner,
+    decision.probe,
+    url,
+    proxyOrigin,
+    "GET",
+    observe,
+    trace,
+    // 缓存还没就绪就输给了回源：如实标 miss-user，别退化成 bypass（本档是用户桶）。
+    decision.probe === null ? "miss-user" : undefined,
+  );
+  if (finishing.kind === "stale") {
+    return fromCache(finishing.stale.res, "stale-error-user", finishing.stale.ageMs, observe);
+  }
+  if (finishing.stored !== undefined) waitUntil(ctx, finishing.stored);
+  return finishing.response;
 }
 
-/* ── 档位三：直连（bypass，同时负责写操作的 epoch 推进）─────────────────── */
+/* ── 档位三：直连（bypass；非 GET 同时负责写操作的 epoch 推进）────────────── */
 
 async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Response> {
   const proxyOrigin = url.origin;
-  if (trace.tCache === undefined) trace.tCache = trace.t0; // 这一档没有缓存查询
+  if (trace.tCache === undefined) trace.tCache = trace.t0; // 这一档没有缓存查询 → cacheMs 恒为 0
 
-  let originRes: Response;
+  // 非 GET 一律不竞速：写操作翻倍且无法取消，只能原样单路回源。
+  if (request.method !== "GET") {
+    trace.race = "none";
+    let originRes: Response;
+    try {
+      trace.tFetch = Date.now();
+      originRes = await fetchOrigin(request, url, { forceGzip: false, canonicalReferer: false });
+      trace.tUp = Date.now(); // 回源响应头到达
+      trace.colo = traceColo(originRes);
+    } catch {
+      return text(502, "Bad Gateway");
+    }
+
+    // 任何非 GET 成功（status < 400）都推进该用户 epoch。
+    // 这里 await 而不是 waitUntil：响应一返回，浏览器就会紧接着发下一个 GET，
+    // 那一发必须已经能读到新 epoch，否则「回帖后仍看到旧页面」的原问题会重新出现。
+    if (originRes.status < 400) {
+      await bumpEpochForRequest(request);
+    }
+
+    const { response } = processOrigin(originRes, url, proxyOrigin, null, request.method);
+    return response;
+  }
+
+  // GET（bypass 档）：没有缓存可查，但两路回源照样竞速 —— 慢的那一路不再拖住用户。
+  trace.tFetch = Date.now();
+  const race = startOriginRace(request, url, { forceGzip: false, canonicalReferer: false });
+  let winner: OriginWinner;
   try {
-    trace.tFetch = Date.now();
-    originRes = await fetchOrigin(request, url, { forceGzip: false, canonicalReferer: false });
-    trace.tUp = Date.now(); // 回源响应头到达
-    trace.colo = traceColo(originRes);
+    winner = await race.winner;
   } catch {
-    return text(502, "Bad Gateway");
+    return text(502, "Bad Gateway"); // 两路都抛：原来的错误路径
   }
-
-  // 任何非 GET 成功（status < 400）都推进该用户 epoch。
-  // 这里 await 而不是 waitUntil：响应一返回，浏览器就会紧接着发下一个 GET，
-  // 那一发必须已经能读到新 epoch，否则「回帖后仍看到旧页面」的原问题会重新出现。
-  if (request.method !== "GET" && originRes.status < 400) {
-    await bumpEpochForRequest(request);
-  }
-
-  const { response } = processOrigin(originRes, url, proxyOrigin, null, request.method);
-  return response;
+  const finishing = await finishOriginRace(winner, null, url, proxyOrigin, "GET", undefined, trace);
+  // 这一档没有缓存（probe 恒为 null），所以不会走到 stale 兜底。
+  return finishing.kind === "response" ? finishing.response : text(502, "Bad Gateway");
 }
 
 /* ── 入口 ───────────────────────────────────────────────────────────────── */
@@ -1143,19 +1470,39 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   // Server-Timing 是唯一会写响应头的东西（withServerTiming，内部全 try/catch）。
   const tEnd = Date.now();
   const totalMs = Math.max(0, tEnd - t0);
-  // 反代 → Worker 往返：发起回源到拿到响应头；没有回源（缓存命中）时为 0。
+  // up = 赢家那一路「发起 fetch → 拿到响应头」的实际耗时；赢家是缓存时为 0。
   const upstreamMs = trace.tFetch === undefined ? 0 : Math.max(0, (trace.tUp ?? tEnd) - trace.tFetch);
-  // 纯代理开销：进函数 → 发起回源（= (tUp - t0) - up，代数上就是 tFetch - t0）。
-  // 没有回源（缓存命中）= 整个函数耗时；回源失败（没拿到头）也只算到发起那一刻，不把等待算进来。
+  // proxy = 进函数 → 发起回源（tFetch - t0）。竞速后回源在 handler 一进来就发，
+  // 所以它现在只剩「进函数 → 开始回源」的那点开销；缓存那一段单独由 cacheMs 表示。
+  // 没有回源（缓存命中）= 整个函数耗时。
   const proxyMs = trace.tFetch === undefined ? totalMs : Math.max(0, trace.tFetch - t0);
+  // cacheMs = 进函数 → 缓存查询结束（caches.open + match，用户档还含 epoch 读取）。
+  // 直连档没有缓存查询：tCache 在 serveDirect 里取了 t0，恒为 0。
+  const cacheMsNow = trace.tCache === undefined ? undefined : Math.max(0, trace.tCache - t0);
+  const raceName = trace.race ?? "none";
   const cacheState = traceCacheState(response.headers.get(CACHE_STATE));
   // 只有本次真的回源（miss / miss-user / bypass）才透传源站的 d1/ssr/app；
   // 缓存回放（hit / stale*）里那份是「当初那次」的数，透传会把旧数冒充本次。
   const originFresh = cacheState === "miss" || cacheState === "miss-user" || cacheState === "bypass";
   try {
-    const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS;
-    if (slow || Math.random() < TRACE_SAMPLE_RATE) {
-      reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs);
+    const sample = Math.random() < TRACE_SAMPLE_RATE;
+    // 缓存慢本身也算「慢请求」：竞速后回源会抢跑，这类请求的 total/up 都很漂亮，
+    // 只有 cacheMs 能把「缓存卡了 11s」暴露出来，否则它们只会落在 2% 采样里。
+    const report = (cacheMs: number): void => {
+      const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS || cacheMs > TRACE_UP_SLOW_MS;
+      if (slow || sample) {
+        reportTrace(ctx, trace, url, cacheState, upstreamMs, totalMs, proxyMs, cacheMs, raceName);
+      }
+    };
+    if (cacheMsNow !== undefined) {
+      report(cacheMsNow);
+    } else {
+      // 缓存查询到交响应时都还没结束（这次它被回源抢跑了）：等它跑完再报，
+      // cacheMs 才是真实值。上报本来就是 fire-and-forget，这里只是把「报」推迟。
+      const settle = trace.cacheSettled;
+      const later = (): void => report(Math.max(0, (trace.tCache ?? Date.now()) - t0));
+      if (settle === undefined) later();
+      else waitUntil(ctx, settle.then(later));
     }
   } catch {
     // 埋点自身任何异常一律吞掉：响应保持不变
