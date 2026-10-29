@@ -169,6 +169,120 @@ type StorePlan = {
 /** 只用于观测的请求上下文（用户桶）：绝不包含完整 cookie 或完整 hash。 */
 type Observe = { user?: string; epoch?: number };
 
+/**
+ * 链路追踪打点（2026-10-29）：只记时间，不改任何现有逻辑。
+ * 目的：定位「到底哪一段慢」—— 代理是唯一同时看得见「查缓存」与「回源」两段时间的地方。
+ *   · t0      进 handler
+ *   · tCache  缓存查询结束（三档都要有；直连档没有缓存查询，取 t0）
+ *   · tUp     回源响应头到达（fetch 返回那一刻）
+ *   · tEnd    返回响应前（在 handler 里算）
+ * 上报是 fire-and-forget（ctx.waitUntil + fetch().catch），绝不 await，失败完全静默。
+ */
+type Trace = {
+  t0: number;
+  /** 缓存查询结束；直连档没有缓存查询，取 t0。 */
+  tCache?: number;
+  /** 发起回源 fetch 的时刻；没有回源（缓存命中）时为空。 */
+  tFetch?: number;
+  /** 回源响应头到达（fetch 返回那一刻）。 */
+  tUp?: number;
+  /** 回源响应头 cf-ray 的后缀（`a51a…-HKG` → `HKG`），拿不到就是 `?`。 */
+  colo?: string;
+};
+
+/** 慢请求判定阈值：上游 > 800ms 或 总时长 > 2000ms 必报；其余按 2% 随机采样对照。 */
+const TRACE_UP_SLOW_MS = 800;
+const TRACE_TOTAL_SLOW_MS = 2_000;
+const TRACE_SAMPLE_RATE = 0.02;
+
+/**
+ * path 归一化（**必须与源站 `app/routes/api.trace.tsx` 的 normalizeTracePath 逐字一致**）：
+ * 代理先做一次，源站再兜一次，防漏。规则：
+ *   ① 只保留 pathname（`?query` / `#hash` 丢掉）；② 去空白与控制字符；
+ *   ③ 含数字的段 → `*`；④ 实体前缀下的第一段动态位 → `*`（`/character/abc` → `/character/*`）；
+ *   ⑤ `/`、`/messages` 这类静态段原样保留；重复斜杠折叠；最长 120 字。
+ */
+const TRACE_ENTITY_ROOTS: ReadonlySet<string> = new Set([
+  "post",
+  "character",
+  "user",
+  "space",
+  "u",
+  "tag",
+]);
+
+function normalizeTracePath(raw: string): string {
+  let value = String(raw ?? "").slice(0, 2048);
+  const cut = value.search(/[?#]/);
+  if (cut >= 0) value = value.slice(0, cut);
+  value = value.replace(/[\s\u0000-\u001f\u007f]+/g, "");
+  if (!value.startsWith("/")) value = `/${value}`;
+
+  const segments = value.split("/");
+  // segments[0] 是空串、segments[1] 是根段，所以动态位从 2 开始。
+  for (let i = 2; i < segments.length; i += 1) {
+    const segment = segments[i] ?? "";
+    if (segment.length === 0) continue;
+    if (/\d/.test(segment)) segments[i] = "*";
+    else if (i === 2 && TRACE_ENTITY_ROOTS.has(segments[1] ?? "")) segments[i] = "*";
+  }
+
+  const out = segments.join("/").replace(/\/{2,}/g, "/");
+  return out.slice(0, 120) || "/";
+}
+
+/** 只发源站白名单里的六种档位；stale-error 归 stale，没有状态头（502）记 `?`。 */
+function traceCacheState(raw: string | null): string {
+  const value = (raw ?? "").trim();
+  if (
+    value === "hit" ||
+    value === "stale" ||
+    value === "miss" ||
+    value === "bypass" ||
+    value === "hit-user" ||
+    value === "miss-user"
+  ) {
+    return value;
+  }
+  return value.startsWith("stale") ? "stale" : "?";
+}
+
+/** 从回源响应头 `cf-ray`（形如 `a51a…-HKG`）取机房后缀；拿不到 / 不合格式都回 `?`。 */
+function traceColo(res: Response): string {
+  const match = /-([A-Z]{3})$/.exec((res.headers.get("cf-ray") ?? "").trim());
+  return match !== null && match[1] !== undefined ? match[1] : "?";
+}
+
+/** fire-and-forget 上报：绝不 await、绝不改响应、失败完全静默（第 4 条）。 */
+function reportTrace(
+  ctx: Context,
+  trace: Trace,
+  requestUrl: URL,
+  cache: string,
+  upstreamMs: number,
+  totalMs: number,
+): void {
+  if (TARGET_BASE.length === 0) return;
+  try {
+    const body = JSON.stringify({
+      path: normalizeTracePath(requestUrl.pathname),
+      cache,
+      upstreamMs,
+      totalMs,
+      colo: trace.colo ?? "?",
+    });
+    ctx.waitUntil(
+      fetch(`${TARGET_BASE}/api/trace`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      }).catch(() => {}),
+    );
+  } catch {
+    // 没有 waitUntil 的运行时 / fetch 同步抛错：埋点失败绝不影响用户响应
+  }
+}
+
 type RefreshJob = {
   request: Request;
   url: URL;
@@ -724,7 +838,7 @@ function tagged(res: Response, observe: Observe): Response {
 
 /* ── 档位一：匿名桶（先查缓存，命中就不回源）────────────────────────────── */
 
-async function serveAnonymous(request: Request, url: URL, ctx: Context): Promise<Response> {
+async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
   const proxyOrigin = url.origin;
 
   let cache: Cache | null = null;
@@ -738,7 +852,11 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context): Promise
     key = cacheKey;
 
     const hit = await openedCache.match(cacheKey);
+    trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
     if (hit) {
+      // 命中时没有回源，但条目里存的就是当初的源站响应头（cf-ray 也在），
+      // 所以 colo 照样能取到；取不到就保持 "?"。
+      trace.colo = traceColo(hit);
       const ageMs = entryAge(hit);
 
       if (ageMs < FRESH_MS) return fromCache(hit, "hit", ageMs);
@@ -757,6 +875,7 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context): Promise
     cache = null;
     key = null; // 拿不到缓存就降级为直连，绝不让缓存故障变成 5xx
   }
+  if (trace.tCache === undefined) trace.tCache = Date.now(); // 缓存打不开 / 提前失败：查询也结束了
 
   // 跟踪参数请求只读不写：写进去的就是带参数的渲染结果。
   const writable = cache !== null && key !== null && !hasTrackingParams(url);
@@ -764,7 +883,10 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context): Promise
 
   let originRes: Response;
   try {
+    trace.tFetch = Date.now();
     originRes = await fetchOrigin(request, url, { forceGzip: true, canonicalReferer: true });
+    trace.tUp = Date.now(); // 回源响应头到达
+    trace.colo = traceColo(originRes);
   } catch {
     if (stale !== null) return fromCache(stale.res, "stale-error", stale.ageMs);
     return text(502, "Bad Gateway");
@@ -783,16 +905,16 @@ async function serveAnonymous(request: Request, url: URL, ctx: Context): Promise
 
 /* ── 档位二：用户桶（先查带 epoch 的键，未命中才回源；写不写看响应头）──── */
 
-async function serveMember(request: Request, url: URL, ctx: Context): Promise<Response> {
+async function serveMember(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {
   const proxyOrigin = url.origin;
   const session = readSessionCookie(request);
-  if (session === null) return serveDirect(request, url); // classifyTier 已保证非空，这里再兜一次
+  if (session === null) return serveDirect(request, url, trace); // classifyTier 已保证非空，这里再兜一次
 
   let uidHash: string;
   try {
     uidHash = await uidHashOf(session);
   } catch {
-    return serveDirect(request, url); // 没有 crypto.subtle：降级直连，绝不 5xx
+    return serveDirect(request, url, trace); // 没有 crypto.subtle：降级直连，绝不 5xx
   }
 
   const tag = uidHash.slice(0, USER_TAG_LEN);
@@ -814,7 +936,10 @@ async function serveMember(request: Request, url: URL, ctx: Context): Promise<Re
     observe = { user: tag, epoch };
 
     const hit = await openedCache.match(cacheKey);
+    trace.tCache = Date.now(); // 缓存查询结束（命中与未命中都在这一刻）
     if (hit) {
+      // 同匿名档：命中条目里存着当初的源站响应头，cf-ray 可用。
+      trace.colo = traceColo(hit);
       const ageMs = entryAge(hit);
 
       if (ageMs < USER_FRESH_MS) return fromCache(hit, "hit-user", ageMs, observe);
@@ -836,6 +961,7 @@ async function serveMember(request: Request, url: URL, ctx: Context): Promise<Re
     key = null;
     stale = null; // 缓存故障时不留半截兜底：直连源站即可，绝不 5xx
   }
+  if (trace.tCache === undefined) trace.tCache = Date.now(); // 缓存打不开 / 提前失败：查询也结束了
 
   const writable = cache !== null && key !== null && !hasTrackingParams(url);
   const plan: StorePlan | null = writable ? userStorePlan(cache!, key!) : null;
@@ -843,7 +969,10 @@ async function serveMember(request: Request, url: URL, ctx: Context): Promise<Re
   let originRes: Response;
   try {
     // 用户桶同样强制 gzip + 规范化 referer：桶里只允许一种编码、一种来源形态。
+    trace.tFetch = Date.now();
     originRes = await fetchOrigin(request, url, { forceGzip: true, canonicalReferer: true });
+    trace.tUp = Date.now(); // 回源响应头到达
+    trace.colo = traceColo(originRes);
   } catch {
     if (stale !== null) return fromCache(stale.res, "stale-error-user", stale.ageMs, observe);
     return tagged(text(502, "Bad Gateway"), observe);
@@ -862,12 +991,16 @@ async function serveMember(request: Request, url: URL, ctx: Context): Promise<Re
 
 /* ── 档位三：直连（bypass，同时负责写操作的 epoch 推进）─────────────────── */
 
-async function serveDirect(request: Request, url: URL): Promise<Response> {
+async function serveDirect(request: Request, url: URL, trace: Trace): Promise<Response> {
   const proxyOrigin = url.origin;
+  if (trace.tCache === undefined) trace.tCache = trace.t0; // 这一档没有缓存查询
 
   let originRes: Response;
   try {
+    trace.tFetch = Date.now();
     originRes = await fetchOrigin(request, url, { forceGzip: false, canonicalReferer: false });
+    trace.tUp = Date.now(); // 回源响应头到达
+    trace.colo = traceColo(originRes);
   } catch {
     return text(502, "Bad Gateway");
   }
@@ -886,19 +1019,41 @@ async function serveDirect(request: Request, url: URL): Promise<Response> {
 /* ── 入口 ───────────────────────────────────────────────────────────────── */
 
 export default async function handler(request: Request, ctx: Context): Promise<Response> {
+  const t0 = Date.now(); // 链路追踪：进函数（2026-10-29）
   if (TARGET_URL === null || TARGET_ORIGIN.length === 0) {
     return text(500, "TARGET_URL environment variable is missing or invalid");
   }
 
   const url = new URL(request.url);
+  const trace: Trace = { t0 };
+  let response: Response;
 
   // 三档分流只在 classifyTier 一处判定，handler 只负责转派。
   switch (classifyTier(request, url)) {
     case "anon":
-      return serveAnonymous(request, url, ctx);
+      response = await serveAnonymous(request, url, ctx, trace);
+      break;
     case "user":
-      return serveMember(request, url, ctx);
+      response = await serveMember(request, url, ctx, trace);
+      break;
     default:
-      return serveDirect(request, url);
+      // 直连档没有缓存查询：tCache = t0（在 serveDirect 里补）
+      response = await serveDirect(request, url, trace);
   }
+
+  // ── 链路追踪上报（tEnd 在这里：返回响应前）───────────────────────────────
+  // 只读时间与响应头（x-proxy-cache / cf-ray），**绝不改响应、绝不加头、绝不影响返回**。
+  try {
+    const tEnd = Date.now();
+    const totalMs = tEnd - t0;
+    // 发起过回源、但响应头没回来（超时/网络错）时，把等待时间也算进上游耗时。
+    const upstreamMs = trace.tFetch === undefined ? 0 : Math.max(0, (trace.tUp ?? tEnd) - trace.tFetch);
+    const slow = upstreamMs > TRACE_UP_SLOW_MS || totalMs > TRACE_TOTAL_SLOW_MS;
+    if (slow || Math.random() < TRACE_SAMPLE_RATE) {
+      reportTrace(ctx, trace, url, traceCacheState(response.headers.get(CACHE_STATE)), upstreamMs, totalMs);
+    }
+  } catch {
+    // 埋点自身任何异常一律吞掉：响应保持不变
+  }
+  return response;
 }
