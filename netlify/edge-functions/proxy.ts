@@ -839,6 +839,22 @@ function isCacheableTarget(url: URL): boolean {
     if (path === prefix || path.startsWith(`${prefix}/`)) return false;
   }
 
+  /**
+   * 2026-10-29（第 56 条）：`.data` / `.rsc` **带 `_routes` 的一律不缓存**。
+   *
+   * 站主实测：登录态会「命中一两下就又不命中」。原因是 React Router 的 single-fetch
+   * 会在不同场景给同一个页面拼出不同的 `_routes=`（局部再验证只请求其中几个路由），
+   * 而缓存键里保留了整个查询串 ⇒ **同一个页面变成多个键**，命中率被摊薄到几乎为零。
+   *
+   * 为什么不能「把 `_routes` 从键里去掉」：带 `_routes` 的那份**只包含被点名的路由**，
+   * 把它回放给一个完整 `.data` 请求，页面会缺数据（比不缓存更糟）。
+   *
+   * 所以取最稳的一刀：**只缓存不带 `_routes` 的完整数据流**（那是导航真正要的那一份），
+   * 带 `_routes` 的再验证请求照旧回源。代价是局部再验证拿不到缓存收益——
+   * 它们本来就只取几个 loader，回源也便宜。
+   */
+  if (isSingleFetchPath(path) && url.searchParams.has("_routes")) return false;
+
   const params = [...url.searchParams];
   if (params.some(([name]) => SENSITIVE_PARAMS.test(name))) return false;
 
@@ -2847,5 +2863,28 @@ export default async function handler(request: Request, ctx: Context): Promise<R
   }
   // Server-Timing：透传源站的 d1/ssr/app，追加本代理的 proxy;dur 与 total;dur。
   // total 用的是上面这一刻的 tEnd（返回响应前），所以包含到「交出首字节」为止的全部反代时间。
-  return withServerTiming(response, proxyMs, totalMs, originFresh);
+  const withTiming = withServerTiming(response, proxyMs, totalMs, originFresh);
+  /**
+   * 2026-10-29（第 57 条）：把**缓存键的可变部分**打到响应头上，用于排查
+   * 「命中一两下就又不命中」。
+   *
+   * 键 = `{uidHash}/{epoch}/{theme}/{engine}` + `cacheIdPath(url)`；前四段对同一个人
+   * 基本恒定，所以**真正会变的是最后一段**（pathname + 规范化后的查询串）。
+   * 站主连续打开同一个页面两次，比较这个头即可判断「是不是每次都换了键」——
+   * 不再靠猜（之前猜过 `_routes`，那是没有证据的）。
+   *
+   * 只放可缓存路径、且长度截断，避免把长 URL 塞进响应头。
+   */
+  try {
+    const keySuffix = cacheIdPath(url).slice(0, 160);
+    const headers = new Headers(withTiming.headers);
+    headers.set("x-proxy-key", keySuffix);
+    return new Response(withTiming.body, {
+      status: withTiming.status,
+      statusText: withTiming.statusText,
+      headers,
+    });
+  } catch {
+    return withTiming;
+  }
 }
