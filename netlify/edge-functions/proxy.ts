@@ -3185,6 +3185,37 @@ export default async function handler(request: Request, ctx: Context): Promise<R
     console.error(
       `[proxy-crash] tier=${trace.tier ?? "?"} ${request.method} ${url.pathname}${url.search} :: ${msg}\n${stack}`,
     );
+    /**
+     * 2026-10-31：**崩溃也要落库**。
+     *
+     * 平台日志只有实时流，请求 ID 只能拿去开工单 —— 站主今天问「能不能从日志定位这一次」，
+     * 答案是查不到。没有落库就等于每次崩溃都只能等下一次复现。
+     *
+     * 这里复用站内已有的 `/api/client-error`（它写 `ip_logs`，有限流与截断），
+     * 记完就能一条 SQL 查：
+     *   SELECT created_at, path FROM ip_logs
+     *    WHERE path LIKE '%proxy-crash%' AND created_at >= datetime('now','-1 day')
+     *     ORDER BY created_at DESC;
+     *
+     * fire-and-forget：上报失败绝不影响用户拿到的那个 502。
+     */
+    try {
+      waitUntil(
+        ctx,
+        fetch(`${TARGET_ORIGIN}/api/client-error`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            kind: "proxycrash",
+            message: `proxy-crash tier=${trace.tier ?? "?"} ${request.method} ${url.pathname}${url.search} :: ${msg}`,
+            stack,
+            url: url.href,
+          }),
+        }).catch(() => undefined),
+      );
+    } catch {
+      // 上报通道自身失败一律吞掉
+    }
     const out = text(502, `proxy error: ${msg}`);
     // ⚠️ 头值里不能有换行：错误信息常带换行，直接 set 会再抛一次（TypeError），
     // 于是兜底自己也崩。这里一律压成单行再截断。
