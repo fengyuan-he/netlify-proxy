@@ -2352,19 +2352,116 @@ type SharedEntry = {
 };
 
 const COALESCE_MAX_BYTES = 2 * 1024 * 1024;
-/** key → 正在取的那一份（null 表示"没合并成功，等待者自己去取"）。 */
-const coalesceInflight = new Map<string, Promise<SharedEntry | null>>();
+/**
+ * 锁超时：等待者最多等这么久，然后就允许"补发"一个自己的回源。
+ *
+ * 取值依据（2026-10-30 实测）：正常未命中 60~430ms（p95≈430），源站超时 15 秒。
+ * 500ms 刚好在 p95 之上、15 秒的 1/30 —— 平静时几乎不触发，卡死时能及时救场。
+ * 这是 nginx `proxy_cache_lock_age` 的同一个语义（它默认 5 秒，我们激进得多，
+ * 因为我们的正常耗时只有几百毫秒，500ms 已经是"明显异常"的信号）。
+ */
+const COALESCE_LOCK_TIMEOUT_MS = 500;
+/**
+ * 补发上限：每个 key、每个 isolate 最多再放行这么多次。
+ *
+ * **这条不能省。** 超时若"到点全部放行"，318 个等待者会同时冲出去，
+ * 比不做合并更糟（nginx 的措辞也是"可以再放**一个**"）。
+ * K=2 ⇒ 每个 key 最多 3 路并发（1 领导 + 2 补发）。
+ */
+const COALESCE_MAX_BREAKOUTS = 2;
+/**
+ * 同一个 key 的合并槽（2026-10-30 第 64 条：加了"超时 + 限额补发"）。
+ *
+ * `collector.first` 解析为**最先成功的那一份**；全部尝试都失败/不可共享时解析为 null。
+ */
+type CoalesceSlot = {
+  collector: CoalesceCollector;
+  /** 已经补发过几次（上限 COALESCE_MAX_BREAKOUTS）。 */
+  breakouts: number;
+  /** 仍在飞行的尝试数（归零且没人用时回收这个槽）。 */
+  pending: number;
+  /** 这个槽最后有没有人拿到结果（用于决定是否立刻删）。 */
+  done?: boolean;
+};
 
-function replayShared(shared: SharedEntry): Response {
+type CoalesceCollector = { first: Promise<SharedEntry | null>; add: (p: Promise<{ shared: SharedEntry | null }>) => void };
+
+/**
+ * 收集"同一 key 的多次尝试"，第一个成功的赢。
+ *
+ * 为什么需要它：超时补发之后，同一 key 可能同时有 1~3 个在飞。
+ * 等待者应该拿**最先成功**的那一份，而不是"只认最早那个领导"——
+ * 否则超时补发就失去意义（补发的那个先回来也没人用）。
+ */
+function makeCollector(): CoalesceCollector {
+  let settle: (v: SharedEntry | null) => void = () => undefined;
+  const first = new Promise<SharedEntry | null>((resolve) => {
+    settle = resolve;
+  });
+  let live = 0;
+  let done = false;
+  const add = (p: Promise<{ shared: SharedEntry | null }>): void => {
+    live += 1;
+    void p.then(
+      (r) => {
+        live -= 1;
+        if (done) return;
+        if (r.shared !== null) {
+          done = true;
+          settle(r.shared);
+        } else if (live === 0) {
+          done = true;
+          settle(null); // 全部不可共享
+        }
+      },
+      () => {
+        live -= 1;
+        if (!done && live === 0) {
+          done = true;
+          settle(null); // 全部失败
+        }
+      },
+    );
+  };
+  return { first, add };
+}
+
+/** 记一次尝试：挂进 collector，并在槽的 pending 计数上登记。 */
+function trackAttempt(slot: CoalesceSlot, attempt: () => Promise<{ shared: SharedEntry | null; original: Response | null }>): Promise<{ shared: SharedEntry | null; original: Response | null }> {
+  slot.pending += 1;
+  const p = attempt().finally(() => {
+    slot.pending -= 1;
+  });
+  slot.collector.add(p);
+  return p;
+}
+
+/** 槽里没人了就直接删（避免 Map 常驻，也避免下一次请求读到已结算的旧槽）。 */
+function reapSlot(key: string, slot: CoalesceSlot): void {
+  if (slot.pending === 0) coalesceInflight.delete(key);
+}
+
+/** 等最多 `ms` 毫秒；拿到成功的那一份就返回，等不到返回 null。 */
+function waitShared(collector: CoalesceCollector, ms: number): Promise<SharedEntry | null> {
+  return Promise.race([
+    collector.first,
+    new Promise<SharedEntry | null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
+/** 共享来的响应：删掉 set-cookie（逐客户端），并标记 coalesced 状态。 */
+function markShared(shared: SharedEntry, state: "0" | "1"): Response {
   const headers = new Headers();
   for (const [name, value] of shared.headers) {
-    // 每个客户端的会话 bookmark 不能共享（见上方边界说明）
     if (name.toLowerCase() === "set-cookie") continue;
     headers.append(name, value);
   }
-  headers.set(COALESCE_STATE, "1");
+  headers.set(COALESCE_STATE, state);
   return new Response(shared.body, { status: shared.status, statusText: shared.statusText, headers });
 }
+
+/** key → 合并槽。 */
+const coalesceInflight = new Map<string, CoalesceSlot>();
 
 /**
  * 给一次"缓存未命中的 GET"套上合并。
@@ -2394,18 +2491,10 @@ async function serveCoalesced(
   const { theme, engine } = bucketDimensions(request);
   const key = `${tier}\u0000${uidHash}\u0000${theme}\u0000${engine}\u0000${cacheIdPath(url)}`;
 
-  const existing = coalesceInflight.get(key);
-  if (existing !== undefined) {
-    const shared = await existing;
-    if (shared !== null) return replayShared(shared);
-    return run(); // 领导那发不可共享：自己做（罕见）
-  }
-
-  let original: Response | null = null;
-  const pending = (async (): Promise<SharedEntry | null> => {
+  /** 自己上去取一份（领导或补发者都走这里）。 */
+  const attempt = async (): Promise<{ shared: SharedEntry | null; original: Response | null }> => {
     const res = await run();
-    original = res;
-    if (res.body === null) return null;
+    if (res.body === null) return { shared: null, original: res };
     let bytes: Uint8Array | null = null;
     try {
       // 读 clone：读失败/超限时**原响应仍然可用**（与延迟写那条路同一手法）
@@ -2413,26 +2502,44 @@ async function serveCoalesced(
     } catch {
       bytes = null;
     }
-    if (bytes === null) return null;
+    if (bytes === null) return { shared: null, original: res };
     const hdrs: Array<[string, string]> = [];
     res.headers.forEach((value, name) => hdrs.push([name, value]));
     // 拷成独立的 ArrayBuffer：bytes 可能只是某个更大缓冲区的视图
     const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    return { status: res.status, statusText: res.statusText, headers: hdrs, body };
-  })();
+    return { shared: { status: res.status, statusText: res.statusText, headers: hdrs, body }, original: res };
+  };
 
-  coalesceInflight.set(key, pending);
-  void pending.finally(() => coalesceInflight.delete(key)).catch(() => undefined);
-
-  const shared = await pending;
-  if (shared === null) {
-    // 不能共享：把原来的响应交出去（clone 已被取消，原流没被动过）
-    return original ?? text(502, "Bad Gateway");
+  const existing = coalesceInflight.get(key);
+  if (existing === undefined) {
+    // ── 我是第一个：当领导 ──────────────────────────────────────────────
+    const slot: CoalesceSlot = { collector: makeCollector(), breakouts: 0, pending: 0 };
+    coalesceInflight.set(key, slot);
+    const mine = trackAttempt(slot, attempt);
+    try {
+      const got = await mine;
+      if (got.shared !== null) return markShared(got.shared, "0");
+      return got.original ?? text(502, "Bad Gateway");
+    } finally {
+      reapSlot(key, slot);
+    }
   }
-  const headers = new Headers();
-  for (const [name, value] of shared.headers) headers.append(name, value);
-  headers.set(COALESCE_STATE, "0"); // 0 = 我是那个真去取的
-  return new Response(shared.body, { status: shared.status, statusText: shared.statusText, headers });
+
+  // ── 已经有领导在：先等，超时就按上限补发 ─────────────────────────────
+  const got = await waitShared(existing.collector, COALESCE_LOCK_TIMEOUT_MS);
+  if (got !== null) return markShared(got, "1");
+  if (existing.breakouts < COALESCE_MAX_BREAKOUTS) {
+    existing.breakouts += 1;
+    trackAttempt(existing, attempt);
+    const later = await existing.collector.first;
+    if (later !== null) return markShared(later, "1");
+  } else {
+    // 补发额度用尽：不再放行，死等最先成功的那一份
+    const last = await existing.collector.first;
+    if (last !== null) return markShared(last, "1");
+  }
+  // 所有尝试都没能共享（>2MiB / 读失败）：自己做一次（罕见）
+  return run();
 }
 
 async function serveAnonymous(request: Request, url: URL, ctx: Context, trace: Trace): Promise<Response> {  const proxyOrigin = url.origin;
