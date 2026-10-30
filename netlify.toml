@@ -1,3 +1,167 @@
+# 生产反代：所有「动态」请求交给 Edge Function（proxy），静态资源交给 Netlify CDN。
+#
+# 2026-10-30：**静态资源从边缘函数里摘出来**。
+# 起因：Netlify 免费档每月 100 万次边缘函数调用，而实测一天就用了 12.6 万次 ——
+# 绝大多数是 `/assets/*.js`、`/img/*.jpg` 这类资源，不是页面。
+# 处理：用 `excludedPath` 把它们挡在函数之外，再用 `[[redirects]] status=200`
+# 让 **CDN 直接代理**（redirects 不计边缘函数调用）。
+#
+# 为什么这样是安全的：
+#   · `/assets/*` 是带哈希的构建产物（内容寻址、永久不变）
+#   · `/img/*` 的文件名就是内容哈希（同样不变）
+#   · 根目录那些图标 / manifest / splash 由源站 `public/_headers` 声明了缓存策略
+#   · 它们都**不需要按人区分、也不需要改写响应头** —— 当年「纯 CDN 代理」踩过的坑
+#     （无缓存头、Vary 串号、表单 Origin）在这里都不存在。
+[build]
+  publish = "."
+
+# ── 静态资源：不走函数，由 CDN 代理 ─────────────────────────────────────────
+# 构建产物（带内容哈希，永久缓存）
+[[redirects]]
+  from = "/assets/*"
+  to = "https://xn--fpr224a.mom/assets/:splat"
+  status = 200
+  force = true
+
+# 用户图片（R2，文件名即内容哈希）
+[[redirects]]
+  from = "/img/*"
+  to = "https://xn--fpr224a.mom/img/:splat"
+  status = 200
+  force = true
+
+# 头像框（SVG，5 个）
+[[redirects]]
+  from = "/frames/*"
+  to = "https://xn--fpr224a.mom/frames/:splat"
+  status = 200
+  force = true
+
+# ffmpeg.wasm 的**薄包装**（7 个小文件，最大 10KB）。
+# 30.7MB 的内核（ffmpeg-core.js / .wasm）**不在本站**，由 `promo-video.ts` 从公共镜像并发拉取，
+# 所以这里只需要放行 /ffmpeg/* 这几个小文件。
+[[redirects]]
+  from = "/ffmpeg/*"
+  to = "https://xn--fpr224a.mom/ffmpeg/:splat"
+  status = 200
+  force = true
+
+# 站内音频
+[[redirects]]
+  from = "/audio/*"
+  to = "https://xn--fpr224a.mom/audio/:splat"
+  status = 200
+  force = true
+
+# Android App Links 等（内容必须原样，不能改写）
+[[redirects]]
+  from = "/.well-known/*"
+  to = "https://xn--fpr224a.mom/.well-known/:splat"
+  status = 200
+  force = true
+
+# 根目录图标 / PWA 文件（名字里没有哈希，但 `_headers` 已给了短缓存）
+[[redirects]]
+  from = "/favicon.ico"
+  to = "https://xn--fpr224a.mom/favicon.ico"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/favicon-*"
+  to = "https://xn--fpr224a.mom/favicon-:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/apple-touch-icon.png"
+  to = "https://xn--fpr224a.mom/apple-touch-icon.png"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/icon-*"
+  to = "https://xn--fpr224a.mom/icon-:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/mascot.webp"
+  to = "https://xn--fpr224a.mom/mascot.webp"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/mascot-small.webp"
+  to = "https://xn--fpr224a.mom/mascot-small.webp"
+  status = 200
+  force = true
+
+# ⚠️ 名字有两个：
+#   · 页面 `<link rel="manifest">` 引用的是 `/pwa.webmanifest`
+#   · `public/` 里还有一个静态的 `manifest.webmanifest`
+#   两者都由源站返回同一个清单（`workers/static-pages.ts` 同时接受这两个名字），
+#   所以**两个都要排除**，否则每次加载页面都会多一次边缘函数调用。
+[[redirects]]
+  from = "/pwa.webmanifest"
+  to = "https://xn--fpr224a.mom/pwa.webmanifest"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/manifest.webmanifest"
+  to = "https://xn--fpr224a.mom/manifest.webmanifest"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/nojs.webmanifest"
+  to = "https://xn--fpr224a.mom/nojs.webmanifest"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/robots.txt"
+  to = "https://xn--fpr224a.mom/robots.txt"
+  status = 200
+  force = true
+
+# Service Worker：源站对它发 `no-cache`，必须每次回源校验；CDN 代理会原样透传
+[[redirects]]
+  from = "/sw.js"
+  to = "https://xn--fpr224a.mom/sw.js"
+  status = 200
+  force = true
+
+# iOS 启动图（约 40 个，`_headers` 给 7 天）
+[[redirects]]
+  from = "/splash-*"
+  to = "https://xn--fpr224a.mom/splash-:splat"
+  status = 200
+  force = true
+
+# ── 其余（HTML / .data / /api）仍然交给边缘函数 ─────────────────────────────
+# `excludedPath` 在路由阶段就排除上面这些路径，函数根本不会被调用。
 [[edge_functions]]
   path = "/*"
+  excludedPath = [
+    "/assets/*",
+    "/img/*",
+    "/frames/*",
+    "/audio/*",
+    "/ffmpeg/*",
+    "/.well-known/*",
+    "/favicon.ico",
+    "/favicon-*",
+    "/apple-touch-icon.png",
+    "/icon-*",
+    "/mascot.webp",
+    "/mascot-small.webp",
+    "/manifest.webmanifest",
+    "/pwa.webmanifest",
+    "/nojs.webmanifest",
+    "/robots.txt",
+    "/sw.js",
+    "/splash-*",
+  ]
   function = "proxy"
