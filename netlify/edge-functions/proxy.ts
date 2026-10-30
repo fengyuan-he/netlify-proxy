@@ -3148,24 +3148,49 @@ export default async function handler(request: Request, ctx: Context): Promise<R
 
   // 第四档（静态资源）在分流之前单独判一次：GET + 静态前缀 + 无 Range 才接管。
   // 不匹配的请求一个字节都不多走 —— 下面的 classifyTier 与三档代码完全没改过。
-  if (isStaticRequest(request, url)) {
-    trace.tier = "static";
-    response = await serveStatic(request, url, ctx, trace);
-  } else {
-    // 三档分流只在 classifyTier 一处判定，handler 只负责转派。
-    // 这里顺手把档位记进 trace（纯函数，重复调用无副作用）。
-    trace.tier = classifyTier(request, url);
-    switch (trace.tier) {
-      case "anon":
-        response = await serveCoalesced("anon", request, url, () => serveAnonymous(request, url, ctx, trace));
-        break;
-      case "user":
-        response = await serveCoalesced("user", request, url, () => serveMember(request, url, ctx, trace));
-        break;
-      default:
-        // 直连档没有缓存查询：tCache = t0（在 serveDirect 里补）
-        response = await serveDirect(request, url, trace);
+  /**
+   * 2026-10-31：**这里原来没有 try/catch，是昨天那张红页的直接原因。**
+   *
+   * 站主截图里 Netlify 渲染的是它自己的错误页「这个边缘函数崩溃了 / edge function invocation failed」——
+   * 那不是我们画的，是**函数抛出了未捕获异常**后平台兜的底。一次偶发抛错（缓存 API 失败、
+   * fetch 网络异常、Response 构造失败…）就等于用户看到一张红页，而我们连日志都没有。
+   *
+   * 现在：任何抛错都转成 **502 + 一行人话 + `x-proxy-crash` 头**，同时 `console.error` 打出
+   * `[proxy-crash]` + 档位 + 方法 + 路径 + 栈，Netlify 的 Functions 日志里可以直接搜。
+   * 注意：这只兜「异常」，不兜「慢」——慢仍然是 502/超时那条既有路径。
+   */
+  try {
+    if (isStaticRequest(request, url)) {
+      trace.tier = "static";
+      response = await serveStatic(request, url, ctx, trace);
+    } else {
+      // 三档分流只在 classifyTier 一处判定，handler 只负责转派。
+      // 这里顺手把档位记进 trace（纯函数，重复调用无副作用）。
+      trace.tier = classifyTier(request, url);
+      switch (trace.tier) {
+        case "anon":
+          response = await serveCoalesced("anon", request, url, () => serveAnonymous(request, url, ctx, trace));
+          break;
+        case "user":
+          response = await serveCoalesced("user", request, url, () => serveMember(request, url, ctx, trace));
+          break;
+        default:
+          // 直连档没有缓存查询：tCache = t0（在 serveDirect 里补）
+          response = await serveDirect(request, url, trace);
+      }
     }
+  } catch (err) {
+    const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    const stack = err instanceof Error ? (err.stack ?? "") : "";
+    console.error(
+      `[proxy-crash] tier=${trace.tier ?? "?"} ${request.method} ${url.pathname}${url.search} :: ${msg}\n${stack}`,
+    );
+    const out = text(502, `proxy error: ${msg}`);
+    // ⚠️ 头值里不能有换行：错误信息常带换行，直接 set 会再抛一次（TypeError），
+    // 于是兜底自己也崩。这里一律压成单行再截断。
+    out.headers.set("x-proxy-crash", msg.replace(/[\r\n]+/g, " ").slice(0, 120));
+    out.headers.set("x-proxy-tier", trace.tier ?? "unknown");
+    return out;
   }
 
   // ── 链路追踪上报 + 分段计时（tEnd 在这里：返回响应前）────────────────────
